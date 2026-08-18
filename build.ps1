@@ -206,11 +206,14 @@ if (-not (Test-Path $fullPs1)) { Write-Host "FALTA Core\SettVPN_Full.ps1" -Foreg
 if (-not (Test-Path $guiPs1))  { Write-Host "FALTA Core\SettVPN_Gui.ps1" -ForegroundColor Red; exit 1 }
 if (-not (Test-Path $winIco))  { Write-Host "FALTA Core\settvpn.ico" -ForegroundColor Red; exit 1 }
 
-# Referencia do PowerShell (host in-process no exe, para o icone correto na taskbar)
-$psAsm = $null
-try { $psAsm = [System.Management.Automation.PowerShell].Assembly.Location } catch { }
-if (-not $psAsm -or -not (Test-Path $psAsm)) {
-    $psAsm = "C:\Windows\Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation\v4.0_3.0.0.0__31bf3856ad364e35\System.Management.Automation.dll"
+# Referencia do PowerShell (Windows PowerShell 5.1 / .NET Framework 4.0) - compativel com o csc.exe 4.0.
+# Nao usar a assembly do PowerShell 7 (Core/.NET 10): o csc.exe 4.0 nao referencia assemblies .NET 5+.
+$psAsm = "C:\Windows\Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation\v4.0_3.0.0.0__31bf3856ad364e35\System.Management.Automation.dll"
+if (-not (Test-Path $psAsm)) {
+    $psAsm = "C:\Windows\System32\WindowsPowerShell\v1.0\System.Management.Automation.dll"
+}
+if (-not (Test-Path $psAsm)) {
+    try { $psAsm = [System.Management.Automation.PowerShell].Assembly.Location } catch { }
 }
 if (-not (Test-Path $psAsm)) { Write-Host "FALTA System.Management.Automation.dll" -ForegroundColor Red; exit 1 }
 
