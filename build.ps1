@@ -174,14 +174,20 @@ if (-not (Test-Path $v2rayExe) -or -not (Test-Path $wintunDll)) {
 
     $xrayExeFound = Get-ChildItem -Path $xrayCache -Recurse -Filter "xray.exe" | Select-Object -First 1
     $wintunFound  = Get-ChildItem -Path $xrayCache -Recurse -Filter "wintun.dll" | Select-Object -First 1
+
+    # Renomeia xray.exe -> v2ray.exe (nomes distintos, sem risco de copiar sobre si)
     if ($xrayExeFound) {
         $target = Join-Path $xrayCache "v2ray.exe"
         if (Test-Path $target) { Remove-Item $target -Force }
-        if ($xrayExeFound.FullName -ne $target) { Copy-Item -LiteralPath $xrayExeFound.FullName -Destination $target -Force }
+        Copy-Item -LiteralPath $xrayExeFound.FullName -Destination $target -Force
     }
+
+    # Garante wintun.dll na raiz do cache (zip pode extrair em subpasta)
     if ($wintunFound) {
         $target = Join-Path $xrayCache "wintun.dll"
-        if ($wintunFound.FullName -ne $target) { Copy-Item -LiteralPath $wintunFound.FullName -Destination $target -Force }
+        if (-not (Test-Path $target)) {
+            Copy-Item -LiteralPath $wintunFound.FullName -Destination $target -Force
+        }
     }
 }
 if (-not (Test-Path $v2rayExe)) { Write-Host "FALHA ao obter xray.exe" -ForegroundColor Red; exit 1 }
