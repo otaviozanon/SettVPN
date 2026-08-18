@@ -400,7 +400,7 @@ function Start-SettVPN-Gui {
           <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
           <StackPanel VerticalAlignment="Center">
             <TextBlock Text="Proxy do sistema" Foreground="#C5C5CC" FontSize="12"/>
-            <TextBlock Text="SOCKS5 - 127.0.0.1:10808" Foreground="#8A8A94" FontSize="10" Margin="0,1,0,0"/>
+            <TextBlock Text="SOCKS5 :10808  ·  HTTP :10809" Foreground="#8A8A94" FontSize="10" Margin="0,1,0,0"/>
           </StackPanel>
           <Button x:Name="btnProxy" Grid.Column="1" Content="OFF" Width="62" Height="30" Style="{StaticResource GhostBtn}"/>
         </Grid>

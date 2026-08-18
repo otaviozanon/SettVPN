@@ -575,6 +575,11 @@ function Generate-V2RayConfig {
                     auth = "noauth"
                     udp = $true
                 }
+            },
+            @{
+                port = 10809
+                protocol = "http"
+                settings = @{}
             }
         )
         outbounds = @()
@@ -731,6 +736,10 @@ function Start-V2Ray {
             Write-Host "     Server    : 127.0.0.1" -ForegroundColor White
             Write-Host "     Porta     : 10808" -ForegroundColor White
             Write-Host "     DNS remoto: ATIVADO (pra nao vazar DNS)" -ForegroundColor White
+            Write-Host "  --------------------------------------------" -ForegroundColor Cyan
+            Write-Host "   Apps sem suporte a SOCKS5 (ex: Discord):" -ForegroundColor Yellow
+            Write-Host "     Use o proxy HTTP 127.0.0.1:10809" -ForegroundColor White
+            Write-Host "     ou ative 'Proxy do sistema' no menu" -ForegroundColor White
             Write-Host "  =============================================" -ForegroundColor Cyan
             Write-Host ""
             return $true
@@ -866,9 +875,9 @@ function Enable-SystemProxy {
         $Script:ProxyBackupEnable = (Get-ItemProperty -Path $path -Name ProxyEnable -ErrorAction SilentlyContinue).ProxyEnable
         $Script:ProxyBackupServer = (Get-ItemProperty -Path $path -Name ProxyServer -ErrorAction SilentlyContinue).ProxyServer
     }
-    Set-ProxyRegistry -Enable 1 -Server "socks=127.0.0.1:10808"
+    Set-ProxyRegistry -Enable 1 -Server "http=127.0.0.1:10809;https=127.0.0.1:10809;socks=127.0.0.1:10808"
     $Script:ProxyActive = $true
-    Write-Status "System proxy enabled: socks=127.0.0.1:10808" "OK"
+    Write-Status "System proxy enabled: http=127.0.0.1:10809 / socks=127.0.0.1:10808" "OK"
 }
 
 function Disable-SystemProxy {
