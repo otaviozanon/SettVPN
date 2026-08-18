@@ -157,6 +157,30 @@ function Populate-ServerList {
     $Script:GuiLblLog.Text = $Script:GuiSync.StatusText
 }
 
+function Add-GuiLog {
+    param([string]$Message, [string]$Type = "INFO")
+
+    if (-not $Script:GuiLstLog) { return }
+
+    $color = switch ($Type) {
+        "OK"    { $Script:BrushGreen }
+        "WARN"  { $Script:BrushGold }
+        "ERROR" { $Script:BrushRed }
+        default { $Script:BrushMuted }
+    }
+
+    $ts = Get-Date -Format "HH:mm:ss"
+    $item = New-Object System.Windows.Controls.ListBoxItem
+    $item.Content = "[$ts] $Message"
+    $item.Foreground = $color
+    $item.FontSize = 10
+    [void]$Script:GuiLstLog.Items.Add($item)
+    $Script:GuiLstLog.ScrollIntoView($item)
+    while ($Script:GuiLstLog.Items.Count -gt 200) {
+        $Script:GuiLstLog.Items.RemoveAt(0)
+    }
+}
+
 function Start-SettVPN-Gui {
     Add-Type -AssemblyName PresentationFramework
     Add-Type -AssemblyName PresentationCore
@@ -404,6 +428,14 @@ function Start-SettVPN-Gui {
           </StackPanel>
           <Button x:Name="btnProxy" Grid.Column="1" Content="OFF" Width="62" Height="30" Style="{StaticResource GhostBtn}"/>
         </Grid>
+
+        <Border Background="#141417" BorderBrush="#2A2A30" BorderThickness="1" CornerRadius="8" Padding="10,8" Margin="0,16,0,0">
+          <StackPanel>
+            <TextBlock Text="ATIVIDADE" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A94" Margin="0,0,0,6"/>
+            <ListBox x:Name="lstLog" Background="Transparent" Foreground="#8A8A94" BorderThickness="0" FontSize="10" Height="90"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled" IsHitTestVisible="False" Focusable="False"/>
+          </StackPanel>
+        </Border>
       </StackPanel>
 
       <Grid Grid.Column="2">
@@ -444,6 +476,7 @@ function Start-SettVPN-Gui {
     $Script:GuiLblPing          = $Script:GuiWindow.FindName("lblPing")
     $Script:GuiLblLog           = $Script:GuiWindow.FindName("lblLog")
     $Script:GuiLstServers       = $Script:GuiWindow.FindName("lstServers")
+    $Script:GuiLstLog           = $Script:GuiWindow.FindName("lstLog")
     $Script:GuiBtnProxy         = $Script:GuiWindow.FindName("btnProxy")
     $Script:GuiBtnConnect       = $Script:GuiWindow.FindName("btnConnect")
     $Script:GuiBtnChange        = $Script:GuiWindow.FindName("btnChange")
@@ -486,19 +519,41 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
 
     $Script:GuiBtnConnect.Add_Click({
         $Script:GuiLblLog.Text = "Carregando servidores..."
-        Invoke-Background -OpScript $connectScript -OnComplete { Update-GuiStatus; Populate-ServerList }
+        Add-GuiLog "Conectando (menor ping)..." "INFO"
+        Invoke-Background -OpScript $connectScript -OnComplete {
+            Update-GuiStatus; Populate-ServerList
+            if ($Script:GuiSync.ConnectedConfig) {
+                Add-GuiLog "Conectado: $($Script:GuiSync.ConnectedConfig.Name)" "OK"
+            }
+            else {
+                Add-GuiLog "Falha ao conectar" "ERROR"
+            }
+        }
     })
 
     $Script:GuiBtnChange.Add_Click({
         $Script:GuiLblLog.Text = "Atualizando servidores..."
-        Invoke-Background -OpScript $refreshScript -OnComplete { Populate-ServerList }
+        Add-GuiLog "Atualizando servidores..." "INFO"
+        Invoke-Background -OpScript $refreshScript -OnComplete {
+            Populate-ServerList
+            Add-GuiLog "$($Script:GuiSync.Servers.Count) servidores encontrados" "OK"
+        }
     })
 
     $Script:GuiBtnConnectSelected.Add_Click({
         $idx = $Script:GuiLstServers.SelectedIndex
         if ($idx -lt 0) { $Script:GuiLblLog.Text = "Selecione um servidor na lista"; return }
         $Script:GuiSync.SelectedIndex = $idx
-        Invoke-Background -OpScript $connectSelectedScript -OnComplete { Update-GuiStatus }
+        Add-GuiLog "Conectando: $($Script:GuiSync.Servers[$idx].Name)" "INFO"
+        Invoke-Background -OpScript $connectSelectedScript -OnComplete {
+            Update-GuiStatus
+            if ($Script:GuiSync.ConnectedConfig) {
+                Add-GuiLog "Conectado: $($Script:GuiSync.ConnectedConfig.Name)" "OK"
+            }
+            else {
+                Add-GuiLog "Falha ao conectar" "ERROR"
+            }
+        }
     })
 
     $Script:GuiBtnDisconnect.Add_Click({
@@ -506,11 +561,18 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
         $Script:GuiSync.ConnectedConfig = $null
         Update-GuiStatus
         $Script:GuiLblLog.Text = "Desconectado"
+        Add-GuiLog "Desconectado" "WARN"
     })
 
     $Script:GuiBtnProxy.Add_Click({
         Toggle-SystemProxy
         Update-ProxyButton
+        if ($Script:ProxyActive) {
+            Add-GuiLog "Proxy do sistema ativado (HTTP 10809 / SOCKS5 10808)" "OK"
+        }
+        else {
+            Add-GuiLog "Proxy do sistema desativado" "WARN"
+        }
     })
 
     $btnClose.Add_Click({
@@ -554,6 +616,7 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
 
     Update-GuiStatus
     Update-ProxyButton
+    Add-GuiLog "Pronto" "INFO"
 
     $Script:GuiWindow.ShowDialog() | Out-Null
 
