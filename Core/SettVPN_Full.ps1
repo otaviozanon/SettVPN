@@ -14,7 +14,9 @@ $Script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:ScriptFile = $MyInvocation.MyCommand.Path
 $Script:TempDir = Join-Path $env:TEMP "SettVPN"
 $Script:V2RayExe = Join-Path $Script:TempDir "v2ray.exe"
+$Script:WintunDll = Join-Path $Script:TempDir "wintun.dll"
 $Script:ConfigJson = Join-Path $Script:TempDir "config.json"
+$Script:XrayLog = Join-Path $Script:TempDir "xray.log"
 $Script:ReadmeCache = Join-Path $Script:TempDir "abc-configs-README.md"
 $Script:SubCache = Join-Path $Script:TempDir "pawdroid-sub.txt"
 $Script:Sub2Cache = Join-Path $Script:TempDir "peasoft-sub.txt"
@@ -340,7 +342,7 @@ function Get-AllConfigs {
         foreach ($match in $matches) {
             $uri = $match.Groups[1].Value -replace '&amp;', '&'
             $parsed = ConvertTo-Config -Uri $uri
-            if ($parsed) { $configs += $parsed }
+            if ($parsed -and (Test-ConfigStable $parsed)) { $configs += $parsed }
         }
         Write-Status "abc-configs: $($matches.Count) found" "INFO"
     }
@@ -369,13 +371,16 @@ function Get-AllConfigs {
             if ($line -match '^(vless|vmess|trojan|ss)://') {
                 $count++
                 $parsed = ConvertTo-Config -Uri $line
-                if ($parsed) { $configs += $parsed }
+                if ($parsed -and (Test-ConfigStable $parsed)) { $configs += $parsed }
             }
         }
         Write-Status "$($src.Label): $count found" "INFO"
     }
 
-    Write-Status "Found $($configs.Count) total configs" "INFO"
+    if ($configs.Count -gt 400) {
+        $configs = @($configs[0..399])
+    }
+    Write-Status "Found $($configs.Count) configs (apos filtro)" "INFO"
     return $configs
 }
 
@@ -561,11 +566,12 @@ function New-StreamSettings {
 }
 
 function Generate-V2RayConfig {
-    param([hashtable]$Config)
+    param([hashtable]$Config, [bool]$Tun = $false)
 
     $configObj = @{
         log = @{
-            loglevel = "warning"
+            loglevel = "info"
+            error    = $Script:XrayLog
         }
         inbounds = @(
             @{
@@ -583,6 +589,20 @@ function Generate-V2RayConfig {
             }
         )
         outbounds = @()
+    }
+
+    if ($Tun) {
+        $configObj.inbounds += @{
+            tag      = "tun-in"
+            protocol = "tun"
+            settings = @{
+                mtu                    = 1500
+                gateway                = @("10.0.0.1/16", "fc00::1/64")
+                dns                    = @("1.1.1.1", "8.8.8.8")
+                autoSystemRoutingTable = @("0.0.0.0/0", "::/0")
+                autoOutboundsInterface = "auto"
+            }
+        }
     }
 
     $paramHash = ConvertTo-ParamHashtable -Params $Config.Params
@@ -695,14 +715,251 @@ function Generate-V2RayConfig {
 # V2RAY PROCESS MANAGER
 # ============================================================
 
-function Start-V2Ray {
+function Test-CloudflareIp {
+    param([string]$IpString)
+
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($IpString, [ref]$parsed)) { return $false }
+    $bytes = $parsed.GetAddressBytes()
+    if ($bytes.Length -ne 4) { return $false }
+    $a = [int]$bytes[0]; $b = [int]$bytes[1]
+    if ($a -eq 104 -and $b -ge 16 -and $b -le 31) { return $true }
+    if ($a -eq 172 -and $b -ge 64 -and $b -le 71) { return $true }
+    if ($a -eq 162 -and ($b -eq 158 -or $b -eq 159)) { return $true }
+    if ($a -eq 173 -and $b -eq 245) { return $true }
+    if ($a -eq 141 -and $b -eq 101) { return $true }
+    if ($a -eq 188 -and $b -eq 114) { return $true }
+    if ($a -eq 190 -and $b -eq 93) { return $true }
+    if ($a -eq 197 -and $b -eq 234) { return $true }
+    if ($a -eq 198 -and $b -eq 41) { return $true }
+    return $false
+}
+
+function Test-ConfigStable {
     param([hashtable]$Config)
+
+    # Rejeita apenas transports que o gerador de config nao suporta (xhttp) ou instaveis (grpc).
+    # Reality e IPs Cloudflare agora passam: o teste de tunel (TLS real) decide se funcionam.
+    $params = [string]$Config['Params']
+    if ($params) {
+        if ($params -match 'type=(grpc|xhttp)') { return $false }
+    }
+
+    return $true
+}
+
+function Scan-StableServers {
+    param([array]$Configs, [int]$MaxToTest = 25, [int]$StabilitySeconds = 10)
+
+    $stable = @()
+    $tested = 0
+    $total = [Math]::Min($Configs.Count, $MaxToTest)
+    if ($total -le 0) { return $stable }
+    if ($Sync) { $Sync.ScanTotal = $total; $Sync.ScanTested = 0; $Sync.ScanStart = [DateTime]::Now }
+    foreach ($cfg in $Configs) {
+        if ($tested -ge $MaxToTest) { break }
+        $tested++
+        if ($Sync) { $Sync.ScanTested = $tested; $Sync.Progress = [int](($tested / $total) * 100) }
+        Write-Status "Testando estabilidade ($tested/$total): $($cfg.Name)" "INFO"
+        if (Start-V2Ray -Config $cfg -StabilitySeconds $StabilitySeconds) {
+            # Exige UDP alem de TCP (Discord/voz, jogos, DNS usam UDP)
+            $udpOk = Test-V2RayUdp
+            Stop-V2Ray
+            if ($udpOk) {
+                $stable += $cfg
+                Write-Status "Estavel (TCP+UDP): $($cfg.Name)" "OK"
+            }
+            else {
+                Write-Status "Sem UDP (descartado): $($cfg.Name)" "WARN"
+            }
+        }
+        else {
+            Write-Status "Descartado: $($cfg.Name)" "WARN"
+        }
+    }
+    if ($Sync) { $Sync.Progress = 100 }
+    return $stable
+}
+
+function Get-ScanRemainingSeconds {
+    param([double]$ElapsedSeconds)
+
+    # Contagem regressiva fixa de 4 min (sempre decrescente, sem pular pra cima)
+    return [int][Math]::Max(0, 240 - $ElapsedSeconds)
+}
+
+# ============================================================
+# GEOLOCALIZACAO (pais do servidor)
+# ============================================================
+
+function Get-CountryNamePt {
+    param([string]$Code)
+
+    if (-not $Code) { return "" }
+    $map = @{
+        'US' = 'Estados Unidos'; 'BR' = 'Brasil'; 'FR' = 'Franca'; 'RU' = 'Russia';
+        'DE' = 'Alemanha'; 'NL' = 'Holanda'; 'GB' = 'Reino Unido'; 'CA' = 'Canada';
+        'JP' = 'Japao'; 'SG' = 'Singapura'; 'HK' = 'Hong Kong'; 'KR' = 'Coreia do Sul';
+        'TR' = 'Turquia'; 'UA' = 'Ucrania'; 'PL' = 'Polonia'; 'SE' = 'Suecia';
+        'IN' = 'India'; 'IT' = 'Italia'; 'ES' = 'Espanha'; 'CH' = 'Suica';
+        'AR' = 'Argentina'; 'CO' = 'Colombia'; 'MX' = 'Mexico'; 'CL' = 'Chile';
+        'PT' = 'Portugal'; 'AT' = 'Austria'; 'BE' = 'Belgica'; 'BG' = 'Bulgaria';
+        'CZ' = 'Republica Tcheca'; 'DK' = 'Dinamarca'; 'FI' = 'Finlandia'; 'GR' = 'Grecia';
+        'HU' = 'Hungria'; 'IE' = 'Irlanda'; 'IL' = 'Israel'; 'NO' = 'Noruega';
+        'RO' = 'Romenia'; 'ZA' = 'Africa do Sul'; 'AU' = 'Australia'; 'NZ' = 'Nova Zelandia';
+        'TW' = 'Taiwan'; 'VN' = 'Vietna'; 'TH' = 'Tailandia'; 'MY' = 'Malasia';
+        'ID' = 'Indonesia'; 'PH' = 'Filipinas'; 'AE' = 'Emirados Arabes'; 'SA' = 'Arabia Saudita';
+        'EG' = 'Egito'; 'NG' = 'Nigeria'; 'KE' = 'Quenia'; 'PK' = 'Paquistao';
+        'BD' = 'Bangladesh'; 'IR' = 'Ira'; 'IQ' = 'Iraque'; 'KZ' = 'Cazaquistao';
+        'GE' = 'Georgia'; 'AM' = 'Armenia'; 'AZ' = 'Azerbaijao'; 'BY' = 'Bielorrussia';
+        'MD' = 'Moldavia'; 'RS' = 'Servia'; 'HR' = 'Croacia'; 'SI' = 'Eslovenia';
+        'SK' = 'Eslovaquia'; 'LT' = 'Lituania'; 'LV' = 'Letonia'; 'EE' = 'Estonia';
+        'CN' = 'China'; 'LU' = 'Luxemburgo'; 'IS' = 'Islandia'; 'CY' = 'Chipre';
+        'MT' = 'Malta'; 'MC' = 'Monaco'; 'LI' = 'Liechtenstein'; 'AD' = 'Andorra';
+        'DO' = 'Republica Dominicana'; 'UY' = 'Uruguai'; 'PY' = 'Paraguai'; 'PE' = 'Peru';
+        'VE' = 'Venezuela'; 'EC' = 'Equador'; 'BO' = 'Bolivia'; 'GT' = 'Guatemala';
+        'CR' = 'Costa Rica'; 'PA' = 'Panama'; 'CU' = 'Cuba'; 'PR' = 'Porto Rico';
+    }
+    if ($map.ContainsKey($Code)) { return $map[$Code] }
+    return $Code
+}
+
+function Get-CountryCodeFromName {
+    param([string]$Name)
+
+    # Infere o codigo de pais a partir de um token de 2 letras MAIUSCULAS no nome
+    # (ex: "US_speednode_0123" -> US). Soh aceita codigos presentes no mapa.
+    if (-not $Name) { return "" }
+    foreach ($m in [regex]::Matches($Name, '(?<![A-Za-z])([A-Z]{2})(?![A-Za-z])')) {
+        $code = $m.Groups[1].Value
+        $pt = Get-CountryNamePt -Code $code
+        if ($pt -and $pt -ne $code) { return $code }
+    }
+    return ""
+}
+
+function Resolve-Countries {
+    param([array]$Configs)
+
+    if (-not $Configs -or $Configs.Count -eq 0) { return }
+
+    # Garante a chave Country/CountryCode em toda config (strict mode) e tenta inferir pelo nome
+    foreach ($cfg in $Configs) {
+        if (-not $cfg.ContainsKey('Country')) { $cfg['Country'] = '' }
+        if (-not $cfg.ContainsKey('CountryCode')) { $cfg['CountryCode'] = '' }
+        $nameCode = Get-CountryCodeFromName -Name ([string]$cfg.Name)
+        if ($nameCode) {
+            $cfg['CountryCode'] = $nameCode
+            $cfg['Country'] = Get-CountryNamePt -Code $nameCode
+        }
+    }
+
+    # Cache em disco: IP -> codigo de pais
+    $cachePath = Join-Path $Script:TempDir 'geo-cache.json'
+    $cache = @{}
+    if (Test-Path $cachePath) {
+        try {
+            $raw = Get-Content $cachePath -Raw -ErrorAction Stop
+            if ($raw) {
+                $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($obj) {
+                    foreach ($p in $obj.PSObject.Properties) {
+                        if ($p.Value) { $cache["$($p.Name)"] = "$($p.Value)" }
+                    }
+                }
+            }
+        }
+        catch { $cache = @{} }
+    }
+
+    # Resolve host -> IP (com cache DNS por execucao). IPs da Cloudflare (fronted) ficam sem pais.
+    $hostToIp = @{}
+    foreach ($cfg in $Configs) {
+        $srvHost = [string]$cfg.Host
+        if (-not $srvHost) { continue }
+        $ip = $null
+        if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) {
+            $ip = $srvHost
+        }
+        elseif (-not $hostToIp.ContainsKey($srvHost)) {
+            try {
+                $addrs = [System.Net.Dns]::GetHostAddresses($srvHost)
+                if ($addrs -and $addrs.Count -gt 0) { $ip = $addrs[0].ToString() }
+            }
+            catch { $ip = $null }
+            $hostToIp[$srvHost] = $ip
+        }
+        else {
+            $ip = $hostToIp[$srvHost]
+        }
+        if ($ip -and $cache.ContainsKey($ip) -and -not $cfg['Country'] -and -not (Test-CloudflareIp -IpString $ip)) {
+            $cfg['CountryCode'] = $cache[$ip]
+            $cfg['Country'] = Get-CountryNamePt -Code $cache[$ip]
+        }
+    }
+
+    # Consulta em lote os IPs sem cache (ip-api.com, ate 100 por chamada)
+    $allIps = @()
+    foreach ($cfg in $Configs) {
+        $srvHost = [string]$cfg.Host
+        $ip = $null
+        if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) { $ip = $srvHost }
+        elseif ($hostToIp.ContainsKey($srvHost)) { $ip = $hostToIp[$srvHost] }
+        if ($ip -and -not $cache.ContainsKey($ip) -and ($allIps -notcontains $ip) -and -not (Test-CloudflareIp -IpString $ip)) {
+            $allIps += $ip
+        }
+    }
+
+    for ($i = 0; $i -lt $allIps.Count; $i += 100) {
+        $chunk = @($allIps[$i..([Math]::Min($i + 99, $allIps.Count - 1))])
+        try {
+            $body = $chunk | ConvertTo-Json
+            $resp = Invoke-WebRequest -Uri 'http://ip-api.com/batch?fields=status,query,countryCode' -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
+            $results = $resp.Content | ConvertFrom-Json
+            foreach ($r in @($results)) {
+                if ($r.status -eq 'success' -and $r.query -and $r.countryCode) {
+                    $cache["$($r.query)"] = "$($r.countryCode)"
+                }
+            }
+        }
+        catch { }
+    }
+
+    # Persiste cache
+    if ($cache.Count -gt 0) {
+        try {
+            [System.IO.File]::WriteAllText($cachePath, ($cache | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+        }
+        catch { }
+    }
+
+    # Aplica resultado final
+    foreach ($cfg in $Configs) {
+        $srvHost = [string]$cfg.Host
+        $ip = $null
+        if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) { $ip = $srvHost }
+        elseif ($hostToIp.ContainsKey($srvHost)) { $ip = $hostToIp[$srvHost] }
+        if ($ip -and $cache.ContainsKey($ip) -and $cache[$ip] -and -not $cfg['Country'] -and -not (Test-CloudflareIp -IpString $ip)) {
+            $cfg['CountryCode'] = $cache[$ip]
+            $cfg['Country'] = Get-CountryNamePt -Code $cache[$ip]
+        }
+    }
+}
+
+function Start-V2Ray {
+    param([hashtable]$Config, [int]$StabilitySeconds = 3, [bool]$Tun = $false)
 
     # Stop existing process
     Stop-V2Ray
 
+    # TUN no Windows exige o driver wintun.dll ao lado do v2ray.exe
+    if ($Tun -and (-not $Script:WintunDll -or -not (Test-Path $Script:WintunDll))) {
+        Write-Status "wintun.dll ausente - modo TUN indisponivel" "ERROR"
+        return $false
+    }
+
     # Generate config
-    if (-not (Generate-V2RayConfig -Config $Config)) {
+    if (-not (Generate-V2RayConfig -Config $Config -Tun $Tun)) {
         return $false
     }
 
@@ -719,14 +976,42 @@ function Start-V2Ray {
         $Script:V2RayProcess = [System.Diagnostics.Process]::Start($psi)
         $Script:CurrentConfig = $Config
 
-        Start-Sleep -Seconds 2
+        # 1) Prontidao: espera o tunel responder (poll ate ~6s, sem sleep cego)
+        $ready = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds(6)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if (-not ($Script:V2RayProcess -and -not $Script:V2RayProcess.HasExited)) {
+                break
+            }
+            if (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500) {
+                $ready = $true
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $ready) {
+            Write-Status "Tunnel check failed: $($Config.Name)" "WARN"
+            Stop-V2Ray
+            return $false
+        }
 
-        if (($Script:V2RayProcess) -and (-not $Script:V2RayProcess.HasExited)) {
-            if (-not (Test-V2RayTunnel)) {
-                Write-Status "Tunnel check failed: $($Config.Name)" "WARN"
+        # 2) Estabilidade: multiplas checagens ativas espacadas (janela de $StabilitySeconds s)
+        $checks = [Math]::Max(1, [int]($StabilitySeconds / 2))
+        for ($i = 0; $i -lt $checks; $i++) {
+            Start-Sleep -Seconds 2
+            if (-not ($Script:V2RayProcess -and -not $Script:V2RayProcess.HasExited)) {
+                Write-Status "v2ray process exited: $($Config.Name)" "ERROR"
                 Stop-V2Ray
                 return $false
             }
+            if (-not (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500)) {
+                Write-Status "Server instavel (caiu): $($Config.Name)" "WARN"
+                Stop-V2Ray
+                return $false
+            }
+        }
+
+        if ($Script:V2RayProcess -and -not $Script:V2RayProcess.HasExited) {
             Write-Status "Connected to VPN: $($Config.Name)" "OK"
             Write-Status "Protocol: $($Config.Protocol) | Server: $($Config.Host):$($Config.Port) | Ping: $($Config.Ping)ms" "INFO"
             Write-Host ""
@@ -745,7 +1030,7 @@ function Start-V2Ray {
             return $true
         }
         else {
-            Write-Status "v2ray process exited immediately" "ERROR"
+            Write-Status "v2ray process exited" "ERROR"
             return $false
         }
     }
@@ -760,7 +1045,7 @@ function Stop-V2Ray {
         try {
             if (-not $Script:V2RayProcess.HasExited) {
                 $Script:V2RayProcess.Kill()
-                $Script:V2RayProcess.WaitForExit(5000)
+                [void]$Script:V2RayProcess.WaitForExit(5000)
             }
             $Script:V2RayProcess.Dispose()
             Write-Status "VPN disconnected" "OK"
@@ -777,53 +1062,109 @@ function Stop-V2Ray {
     Get-Process -Name "v2ray" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
+function New-TlsClientHello {
+    # TLS 1.2 ClientHello minimal (sem SNI) - usado p/ validar fluxo de dados no tunel
+    $ms = New-Object System.IO.MemoryStream
+    $bw = New-Object System.IO.BinaryWriter($ms)
+    $bw.Write([byte]0x16)                       # record: handshake
+    $bw.Write([byte]3); $bw.Write([byte]1)      # record version TLS1.0
+    $bw.Write([byte]0); $bw.Write([byte]0)      # record length (patch depois)
+    $bw.Write([byte]1)                          # handshake: ClientHello
+    $bw.Write([byte]0); $bw.Write([byte]0); $bw.Write([byte]41)  # handshake length
+    $bw.Write([byte]3); $bw.Write([byte]3)      # client version TLS1.2
+    $rng = New-Object System.Random
+    for ($i = 0; $i -lt 32; $i++) { $bw.Write([byte]$rng.Next(256)) }
+    $bw.Write([byte]0)                          # session id length
+    $bw.Write([byte]0); $bw.Write([byte]2)      # cipher suites length
+    $bw.Write([byte]0x00); $bw.Write([byte]0x2F)   # TLS_RSA_WITH_AES_128_CBC_SHA
+    $bw.Write([byte]1)                          # compression methods length
+    $bw.Write([byte]0)                          # null compression
+    $bw.Flush()
+    $arr = $ms.ToArray()
+    $bodyLen = $arr.Length - 5
+    $arr[3] = [byte](($bodyLen -shr 8) -band 0xFF)
+    $arr[4] = [byte]($bodyLen -band 0xFF)
+    $bw.Dispose(); $ms.Dispose()
+    return $arr
+}
+
 function Test-V2RayTunnel {
-    param([int]$TimeoutMs = 4000)
+    param([int]$TimeoutMs = 2500, [int]$Attempts = 2)
 
-    $targetIp = "1.1.1.1"
-    $targetPort = 443
+    # Multiplos alvos (porta 443, pouco bloqueada): dominio valida DNS + roteamento, IP valida roteamento
+    $targets = @(
+        @{ Host = "example.com"; Port = 443 },
+        @{ Host = "1.1.1.1";     Port = 443 },
+        @{ Host = "8.8.8.8";     Port = 443 }
+    )
 
-    for ($attempt = 0; $attempt -lt 3; $attempt++) {
-        $client = $null
-        try {
-            $client = New-Object System.Net.Sockets.TcpClient
-            $client.ReceiveTimeout = $TimeoutMs
-            $client.SendTimeout = $TimeoutMs
+    for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+        foreach ($t in $targets) {
+            $client = $null
+            try {
+                $client = New-Object System.Net.Sockets.TcpClient
+                $client.ReceiveTimeout = $TimeoutMs
+                $client.SendTimeout = $TimeoutMs
 
-            $ar = $client.BeginConnect("127.0.0.1", 10808, $null, $null)
-            if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.Close(); Start-Sleep -Milliseconds 1200; continue }
-            $client.EndConnect($ar)
+                $ar = $client.BeginConnect("127.0.0.1", 10808, $null, $null)
+                if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.Close(); continue }
+                $client.EndConnect($ar)
+                $stream = $client.GetStream()
 
-            $stream = $client.GetStream()
+                # SOCKS5 greeting: no auth
+                $hello = [byte[]](5, 1, 0)
+                $stream.Write($hello, 0, 3)
+                $resp = New-Object byte[] 2
+                if ($stream.Read($resp, 0, 2) -lt 2 -or $resp[1] -ne 0) { $client.Close(); continue }
 
-            # SOCKS5 greeting: no auth
-            $hello = [byte[]](5, 1, 0)
-            $stream.Write($hello, 0, 3)
-            $resp = New-Object byte[] 2
-            if ($stream.Read($resp, 0, 2) -lt 2 -or $resp[1] -ne 0) { $client.Close(); Start-Sleep -Milliseconds 1200; continue }
+                # CONNECT (ATYP=IPv4 ou domain)
+                $ipParsed = $null
+                $isIp = [System.Net.IPAddress]::TryParse([string]$t.Host, [ref]$ipParsed)
+                $portBytes = [BitConverter]::GetBytes([UInt16]$t.Port)
+                [Array]::Reverse($portBytes)
 
-            # CONNECT 1.1.1.1:443
-            $addr = [System.Net.IPAddress]::Parse($targetIp).GetAddressBytes()
-            $portBytes = [BitConverter]::GetBytes([UInt16]$targetPort)
-            [Array]::Reverse($portBytes)
+                if ($isIp) {
+                    $addr = $ipParsed.GetAddressBytes()
+                    $req = New-Object byte[] 10
+                    $req[0] = 5; $req[1] = 1; $req[2] = 0; $req[3] = 1
+                    [Array]::Copy($addr, 0, $req, 4, 4)
+                    $req[8] = $portBytes[0]; $req[9] = $portBytes[1]
+                    $stream.Write($req, 0, 10)
+                }
+                else {
+                    $domainBytes = [System.Text.Encoding]::ASCII.GetBytes([string]$t.Host)
+                    $req = New-Object byte[] (5 + 1 + $domainBytes.Length + 2)
+                    $req[0] = 5; $req[1] = 1; $req[2] = 0; $req[3] = 3
+                    $req[4] = [byte]$domainBytes.Length
+                    [Array]::Copy($domainBytes, 0, $req, 5, $domainBytes.Length)
+                    $req[5 + $domainBytes.Length] = $portBytes[0]
+                    $req[6 + $domainBytes.Length] = $portBytes[1]
+                    $stream.Write($req, 0, $req.Length)
+                }
 
-            $req = New-Object byte[] 10
-            $req[0] = 5; $req[1] = 1; $req[2] = 0; $req[3] = 1
-            [Array]::Copy($addr, 0, $req, 4, 4)
-            $req[8] = $portBytes[0]; $req[9] = $portBytes[1]
-            $stream.Write($req, 0, 10)
+                $reply = New-Object byte[] 256
+                if ($stream.Read($reply, 0, 256) -lt 2 -or $reply[1] -ne 0) { $client.Close(); continue }
 
-            $reply = New-Object byte[] 10
-            if ($stream.Read($reply, 0, 10) -lt 2) { $client.Close(); Start-Sleep -Milliseconds 1200; continue }
-
-            $ok = ($reply[0] -eq 5 -and $reply[1] -eq 0)
-            $client.Close()
-            if ($ok) { return $true }
+                # TLS ClientHello -> valida fluxo de dados real (ServerHello/Alert)
+                $tlsHello = New-TlsClientHello
+                $stream.Write($tlsHello, 0, $tlsHello.Length)
+                $tls = New-Object byte[] 5
+                $n = 0
+                $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+                while ($n -lt 5 -and [DateTime]::UtcNow -lt $deadline) {
+                    $r = $stream.Read($tls, $n, 5 - $n)
+                    if ($r -le 0) { break }
+                    $n += $r
+                }
+                $ok = ($n -ge 5 -and $tls[1] -eq 0x03 -and ($tls[0] -in @(0x14, 0x15, 0x16, 0x17)))
+                $client.Close()
+                if ($ok) { return $true }
+            }
+            catch {
+                if ($client) { try { $client.Close() } catch {} }
+            }
         }
-        catch {
-            if ($client) { try { $client.Close() } catch {} }
-        }
-        Start-Sleep -Milliseconds 1200
+        if ($attempt -lt ($Attempts - 1)) { Start-Sleep -Milliseconds 600 }
     }
     return $false
 }
@@ -831,6 +1172,93 @@ function Test-V2RayTunnel {
 function Get-V2RayStatus {
     if (($Script:V2RayProcess) -and (-not $Script:V2RayProcess.HasExited)) {
         return $true
+    }
+    return $false
+}
+
+function Build-DnsQuery {
+    param([string]$Name = "example.com")
+
+    $q = New-Object System.Collections.Generic.List[byte]
+    $q.Add(0x12); $q.Add(0x34)   # ID
+    $q.Add(0x01); $q.Add(0x00)   # flags: RD
+    $q.Add(0x00); $q.Add(0x01)   # QDCOUNT = 1
+    $q.Add(0x00); $q.Add(0x00)   # ANCOUNT
+    $q.Add(0x00); $q.Add(0x00)   # NSCOUNT
+    $q.Add(0x00); $q.Add(0x00)   # ARCOUNT
+    foreach ($label in $Name -split '\.') {
+        $b = [System.Text.Encoding]::ASCII.GetBytes($label)
+        $q.Add([byte]$b.Length)
+        foreach ($x in $b) { $q.Add($x) }
+    }
+    $q.Add([byte]0)              # terminator
+    $q.Add(0x00); $q.Add(0x01)   # QTYPE = A
+    $q.Add(0x00); $q.Add(0x01)   # QCLASS = IN
+    return $q.ToArray()
+}
+
+function Test-V2RayUdp {
+    param([int]$TimeoutMs = 2500)
+
+    # Valida UDP atraves do tunel via SOCKS5 UDP ASSOCIATE + DNS para 8.8.8.8:53
+    $client = $null
+    $udp = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $client.ReceiveTimeout = $TimeoutMs
+        $client.SendTimeout = $TimeoutMs
+        $ar = $client.BeginConnect("127.0.0.1", 10808, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.Close(); return $false }
+        $client.EndConnect($ar)
+        $stream = $client.GetStream()
+
+        $hello = [byte[]](5, 1, 0)
+        $stream.Write($hello, 0, 3)
+        $resp = New-Object byte[] 2
+        if ($stream.Read($resp, 0, 2) -lt 2 -or $resp[1] -ne 0) { $client.Close(); return $false }
+
+        # UDP ASSOCIATE (CMD=3), ATYP=IPv4, 0.0.0.0:0
+        $req = New-Object byte[] 10
+        $req[0] = 5; $req[1] = 3; $req[2] = 0; $req[3] = 1
+        $stream.Write($req, 0, 10)
+        $reply = New-Object byte[] 256
+        if ($stream.Read($reply, 0, 256) -lt 4 -or $reply[1] -ne 0) { $client.Close(); return $false }
+
+        $atyp = $reply[3]
+        $bndIp = ""; $bndPort = 0
+        if ($atyp -eq 1) {
+            $bndIp = "$($reply[4]).$($reply[5]).$($reply[6]).$($reply[7])"
+            $bndPort = ([int]$reply[8] -shl 8) -bor [int]$reply[9]
+        }
+        elseif ($atyp -eq 3) {
+            $len = [int]$reply[4]
+            $bndIp = [System.Text.Encoding]::ASCII.GetString($reply, 5, $len)
+            $bndPort = ([int]$reply[5 + $len] -shl 8) -bor [int]$reply[6 + $len]
+        }
+        else { $client.Close(); return $false }
+        if (-not $bndIp -or $bndPort -le 0) { $client.Close(); return $false }
+
+        $dns = Build-DnsQuery
+        $hdr = New-Object byte[] (10 + $dns.Length)
+        $dst = [System.Net.IPAddress]::Parse("8.8.8.8").GetAddressBytes()
+        $hdr[3] = 1
+        [Array]::Copy($dst, 0, $hdr, 4, 4)
+        $hdr[8] = 0; $hdr[9] = 53
+        [Array]::Copy($dns, 0, $hdr, 10, $dns.Length)
+
+        $udp = New-Object System.Net.Sockets.UdpClient
+        $udp.Client.ReceiveTimeout = $TimeoutMs
+        $udp.Connect($bndIp, $bndPort)
+        [void]$udp.Send($hdr, $hdr.Length)
+        $remoteEp = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+        $data = $udp.Receive([ref]$remoteEp)
+        $ok = ($data -and $data.Length -gt 0)
+        $udp.Close(); $client.Close()
+        return $ok
+    }
+    catch {
+        if ($udp) { try { $udp.Close() } catch {} }
+        if ($client) { try { $client.Close() } catch {} }
     }
     return $false
 }

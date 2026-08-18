@@ -15,6 +15,12 @@ $Script:GuiSync = [hashtable]::Synchronized(@{
     Runspace        = $null
     OnComplete      = $null
     SelectedIndex   = -1
+    Progress        = 0
+    ScanTotal       = 0
+    ScanTested      = 0
+    ScanStart       = [DateTime]::MinValue
+    TunEnabled      = $false
+    Filtered        = $false
 })
 
 function New-Brush {
@@ -45,6 +51,7 @@ function Invoke-Background {
     $rs = [runspacefactory]::CreateRunspace()
     $rs.Open()
     $rs.SessionStateProxy.SetVariable('GuiSyncRef', $Script:GuiSync)
+    $rs.SessionStateProxy.SetVariable('BadServersRef', $Script:BadServers)
 
     $worker = [powershell]::Create()
     $worker.Runspace = $rs
@@ -52,7 +59,9 @@ function Invoke-Background {
     $setup = @"
 `$Script:TempDir = '$($Script:TempDir)'
 `$Script:V2RayExe = '$($Script:V2RayExe)'
+`$Script:WintunDll = '$($Script:WintunDll)'
 `$Script:ConfigJson = '$($Script:ConfigJson)'
+`$Script:XrayLog = '$($Script:XrayLog)'
 `$Script:ReadmeCache = '$($Script:ReadmeCache)'
 `$Script:SubCache = '$($Script:SubCache)'
 `$Script:Sub2Cache = '$($Script:Sub2Cache)'
@@ -63,6 +72,7 @@ function Invoke-Background {
 `$Script:CurrentConfig = `$null
 `$Script:ProxyActive = `$false
 `$Sync = `$GuiSyncRef
+`$BadServers = `$BadServersRef
 `$ErrorActionPreference = 'Continue'
 "@
 
@@ -89,10 +99,11 @@ function Write-Status { param([string]$Message, [string]$Type = 'INFO'); $Sync.S
 function Set-GuiBusy {
     param([bool]$Busy)
     if (-not $Script:GuiBtnConnect) { return }
-    $Script:GuiBtnConnect.IsEnabled = -not $Busy
+    $Script:GuiBtnConnect.IsEnabled = (-not $Busy) -and $Script:ListReady
     $Script:GuiBtnChange.IsEnabled = -not $Busy
+    $Script:GuiBtnFilter.IsEnabled = -not $Busy
     $Script:GuiBtnDisconnect.IsEnabled = -not $Busy
-    $Script:GuiBtnConnectSelected.IsEnabled = -not $Busy
+    $Script:GuiBtnConnectSelected.IsEnabled = (-not $Busy) -and $Script:ListReady
 }
 
 function Update-GuiStatus {
@@ -101,7 +112,10 @@ function Update-GuiStatus {
         $Script:GuiLblStatus.Text = "CONECTADO"
         $Script:GuiLblStatus.Foreground = $Script:BrushGreen
         $Script:GuiDotStatus.Fill = $Script:BrushGreen
-        $Script:GuiLblServer.Text = [string]$cfg.Name
+        $srvLabel = [string]$cfg.Name
+        $country = [string]$cfg['Country']
+        if ($country) { $srvLabel += "  ($country)" }
+        $Script:GuiLblServer.Text = $srvLabel
         $Script:GuiLblPing.Text = "Ping: $($cfg.Ping)ms  |  $($cfg.Protocol)  |  $($cfg.Host):$($cfg.Port)"
     }
     else {
@@ -123,6 +137,19 @@ function Update-ProxyButton {
         $Script:GuiBtnProxy.Content = "OFF"
         $Script:GuiBtnProxy.Foreground = $Script:BrushMuted
         $Script:GuiBtnProxy.BorderBrush = $Script:BrushBorder
+    }
+}
+
+function Update-TunButton {
+    if ($Script:GuiSync.TunEnabled) {
+        $Script:GuiBtnTun.Content = "ON"
+        $Script:GuiBtnTun.Foreground = $Script:BrushGreen
+        $Script:GuiBtnTun.BorderBrush = $Script:BrushGreen
+    }
+    else {
+        $Script:GuiBtnTun.Content = "OFF"
+        $Script:GuiBtnTun.Foreground = $Script:BrushMuted
+        $Script:GuiBtnTun.BorderBrush = $Script:BrushBorder
     }
 }
 
@@ -150,7 +177,10 @@ function Populate-ServerList {
         $item = New-Object System.Windows.Controls.ListBoxItem
         $item.Style = $style
         $item.Foreground = $color
-        $item.Content = ("{0,4} ms   {1}" -f $ping, [string]$cfg.Name)
+        $label = ("{0,4} ms   {1}" -f $ping, [string]$cfg.Name)
+        $country = [string]$cfg['Country']
+        if ($country) { $label += "  ($country)" }
+        $item.Content = $label
         $item.FontSize = 12
         [void]$Script:GuiLstServers.Items.Add($item)
     }
@@ -181,10 +211,61 @@ function Add-GuiLog {
     }
 }
 
+function Start-GuiHealthCheck {
+    if ($Script:HealthHandle) { return }
+
+    $Script:HealthSync.Result = $null
+    $Script:HealthSync.Busy = $true
+
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.Open()
+        $rs.SessionStateProxy.SetVariable('HealthSyncRef', $Script:HealthSync)
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+
+        $code = $Script:GuiFuncSource + "`n" + @'
+$sync = $HealthSyncRef
+$sync.Result = Test-V2RayTunnel
+$sync.Busy = $false
+'@
+
+        [void]$ps.AddScript($code)
+        $Script:HealthHandle = $ps.BeginInvoke()
+        $Script:HealthPs = $ps
+        $Script:HealthRs = $rs
+    }
+    catch {
+        $Script:HealthSync.Result = $false
+        $Script:HealthSync.Busy = $false
+    }
+}
+
+function Show-GuiWindow {
+    if (-not $Script:GuiWindow) { return }
+    $Script:GuiWindow.ShowInTaskbar = $true
+    $Script:GuiWindow.Show()
+    $Script:GuiWindow.WindowState = 'Normal'
+    [void]$Script:GuiWindow.Activate()
+}
+
 function Start-SettVPN-Gui {
     Add-Type -AssemblyName PresentationFramework
     Add-Type -AssemblyName PresentationCore
     Add-Type -AssemblyName WindowsBase
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    if (-not ("SettVPNNative" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class SettVPNNative {
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+}
+"@
+    }
 
     Initialize-Environment
     if (-not (Extract-V2Ray)) {
@@ -210,7 +291,7 @@ function Start-SettVPN-Gui {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="SETT VPN"
-        Width="820" Height="520"
+        Width="820" Height="590"
         WindowStyle="None"
         AllowsTransparency="True"
         Background="#0A0A0C"
@@ -305,6 +386,31 @@ function Start-SettVPN-Gui {
               <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#2A2A30"/></Trigger>
               <Trigger Property="IsPressed" Value="True"><Setter TargetName="bd" Property="Background" Value="#141417"/></Trigger>
               <Trigger Property="IsEnabled" Value="False"><Setter TargetName="bd" Property="Opacity" Value="0.45"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="InfoBtn" TargetType="Button">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="#8A8A94"/>
+      <Setter Property="Width" Value="18"/>
+      <Setter Property="Height" Value="18"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Margin" Value="6,0,0,0"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="#4A4A54" BorderThickness="1" CornerRadius="9" Width="{TemplateBinding Width}" Height="{TemplateBinding Height}">
+              <TextBlock Text="i" FontWeight="Bold" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{TemplateBinding Foreground}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="bd" Property="Background" Value="#2A2A30"/>
+                <Setter Property="Foreground" Value="#D4AF37"/>
+              </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
@@ -413,27 +519,50 @@ function Start-SettVPN-Gui {
         <Grid Margin="0,8,0,0">
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="8"/>
+            <ColumnDefinition Width="6"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="6"/>
             <ColumnDefinition Width="*"/>
           </Grid.ColumnDefinitions>
           <Button x:Name="btnChange" Grid.Column="0" Content="ATUALIZAR" Height="34" Style="{StaticResource GhostBtn}"/>
-          <Button x:Name="btnDisconnect" Grid.Column="2" Content="DESCONECTAR" Height="34" Style="{StaticResource GhostBtn}"/>
+          <Button x:Name="btnFilter" Grid.Column="2" Content="FILTRAR" Height="34" Style="{StaticResource GhostBtn}"/>
+          <Button x:Name="btnDisconnect" Grid.Column="4" Content="DESCONECTAR" Height="34" Style="{StaticResource GhostBtn}"/>
         </Grid>
 
         <Grid Margin="0,16,0,0">
           <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
           <StackPanel VerticalAlignment="Center">
-            <TextBlock Text="Proxy do sistema" Foreground="#C5C5CC" FontSize="12"/>
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="Proxy do sistema" Foreground="#C5C5CC" FontSize="12" VerticalAlignment="Center"/>
+              <Button x:Name="btnInfoProxy" Style="{StaticResource InfoBtn}" ToolTip="Clique para detalhes"/>
+            </StackPanel>
             <TextBlock Text="SOCKS5 :10808  ·  HTTP :10809" Foreground="#8A8A94" FontSize="10" Margin="0,1,0,0"/>
           </StackPanel>
           <Button x:Name="btnProxy" Grid.Column="1" Content="OFF" Width="62" Height="30" Style="{StaticResource GhostBtn}"/>
         </Grid>
 
+        <Grid Margin="0,8,0,0">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <StackPanel VerticalAlignment="Center">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="Modo TUN (toda rede)" Foreground="#C5C5CC" FontSize="12" VerticalAlignment="Center"/>
+              <Button x:Name="btnInfoTun" Style="{StaticResource InfoBtn}" ToolTip="Clique para detalhes"/>
+            </StackPanel>
+            <TextBlock Text="Roteia Discord/voz · requer admin" Foreground="#8A8A94" FontSize="10" Margin="0,1,0,0"/>
+          </StackPanel>
+          <Button x:Name="btnTun" Grid.Column="1" Content="OFF" Width="62" Height="30" Style="{StaticResource GhostBtn}"/>
+        </Grid>
+
         <Border Background="#141417" BorderBrush="#2A2A30" BorderThickness="1" CornerRadius="8" Padding="10,8" Margin="0,16,0,0">
           <StackPanel>
             <TextBlock Text="ATIVIDADE" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A94" Margin="0,0,0,6"/>
-            <ListBox x:Name="lstLog" Background="Transparent" Foreground="#8A8A94" BorderThickness="0" FontSize="10" Height="90"
+            <ListBox x:Name="lstLog" Background="Transparent" Foreground="#8A8A94" BorderThickness="0" FontSize="10" Height="70"
                      ScrollViewer.HorizontalScrollBarVisibility="Disabled" IsHitTestVisible="False" Focusable="False"/>
+            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+              <TextBlock Text="PROGRESSO" FontSize="10" FontWeight="SemiBold" Foreground="#8A8A94"/>
+              <TextBlock x:Name="lblProgress" Text="" FontSize="10" Foreground="#D4AF37" Margin="8,0,0,0"/>
+            </StackPanel>
+            <ProgressBar x:Name="pbScan" Height="6" Margin="0,5,0,0" Background="#1E1E22" Foreground="#D4AF37" BorderThickness="0" Minimum="0" Maximum="100" Value="0"/>
           </StackPanel>
         </Border>
       </StackPanel>
@@ -460,15 +589,31 @@ function Start-SettVPN-Gui {
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $Script:GuiWindow = [Windows.Markup.XamlReader]::Load($reader)
 
+    $Script:AppIcon = $null
     try {
-        $ico = Join-Path $Script:ScriptDir "settvpn.ico"
-        if (Test-Path $ico) {
-            $fs = [System.IO.File]::OpenRead($ico)
-            $Script:GuiWindow.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create($fs, [System.Windows.Media.Imaging.BitmapCreateOptions]::PreservePixelFormat, [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
-            $fs.Dispose()
+        $exePath = $env:SETTVPN_EXE
+        if ($exePath -and (Test-Path $exePath)) {
+            $Script:AppIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($exePath)
         }
     }
     catch { }
+    if (-not $Script:AppIcon) {
+        try {
+            $ico = Join-Path $Script:ScriptDir "settvpn.ico"
+            if (Test-Path $ico) { $Script:AppIcon = New-Object System.Drawing.Icon($ico) }
+        }
+        catch { }
+    }
+    if ($Script:AppIcon) {
+        try {
+            $Script:GuiWindow.Icon = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
+                $Script:AppIcon.Handle,
+                [System.Windows.Int32Rect]::Empty,
+                [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions()
+            )
+        }
+        catch { }
+    }
 
     $Script:GuiLblStatus        = $Script:GuiWindow.FindName("lblStatus")
     $Script:GuiDotStatus        = $Script:GuiWindow.FindName("dotStatus")
@@ -477,50 +622,160 @@ function Start-SettVPN-Gui {
     $Script:GuiLblLog           = $Script:GuiWindow.FindName("lblLog")
     $Script:GuiLstServers       = $Script:GuiWindow.FindName("lstServers")
     $Script:GuiLstLog           = $Script:GuiWindow.FindName("lstLog")
+    $Script:GuiPbScan           = $Script:GuiWindow.FindName("pbScan")
+    $Script:GuiLblProgress      = $Script:GuiWindow.FindName("lblProgress")
     $Script:GuiBtnProxy         = $Script:GuiWindow.FindName("btnProxy")
+    $Script:GuiBtnTun           = $Script:GuiWindow.FindName("btnTun")
+    $Script:GuiBtnInfoProxy     = $Script:GuiWindow.FindName("btnInfoProxy")
+    $Script:GuiBtnInfoTun       = $Script:GuiWindow.FindName("btnInfoTun")
     $Script:GuiBtnConnect       = $Script:GuiWindow.FindName("btnConnect")
     $Script:GuiBtnChange        = $Script:GuiWindow.FindName("btnChange")
+    $Script:GuiBtnFilter        = $Script:GuiWindow.FindName("btnFilter")
     $Script:GuiBtnDisconnect    = $Script:GuiWindow.FindName("btnDisconnect")
     $Script:GuiBtnConnectSelected = $Script:GuiWindow.FindName("btnConnectSelected")
     $btnClose          = $Script:GuiWindow.FindName("btnClose")
     $btnMin            = $Script:GuiWindow.FindName("btnMin")
     $titleBar          = $Script:GuiWindow.FindName("titleBar")
 
-    $connectScript = @'
+    # Tray icon: fecha janela -> continua rodando na bandeja
+    $Script:TrayIcon = New-Object System.Windows.Forms.NotifyIcon
+    $Script:TrayIcon.Text = "SETT VPN"
+    if ($Script:AppIcon) {
+        $Script:TrayIcon.Icon = $Script:AppIcon
+    }
+    $Script:TrayIcon.Visible = $true
+
+    $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+    $menuOpen = New-Object System.Windows.Forms.ToolStripMenuItem "Abrir"
+    $menuExit = New-Object System.Windows.Forms.ToolStripMenuItem "Sair"
+    $menuOpen.Add_Click({
+        Show-GuiWindow
+    })
+    $menuExit.Add_Click({
+        try { $Script:GuiWindow.Close() } catch {}
+        if ($Script:MainFrame) { $Script:MainFrame.Continue = $false }
+    })
+    [void]$trayMenu.Items.Add($menuOpen)
+    [void]$trayMenu.Items.Add($menuExit)
+    $Script:TrayIcon.ContextMenuStrip = $trayMenu
+    $Script:TrayIcon.Add_DoubleClick({
+        Show-GuiWindow
+    })
+
+    # Health check state
+    $Script:HealthSync = [hashtable]::Synchronized(@{ Busy = $false; Result = $null })
+    $Script:HealthHandle = $null
+    $Script:HealthPs = $null
+    $Script:HealthRs = $null
+    $Script:LastHealthCheck = [DateTime]::MinValue
+    $Script:BadServers = [hashtable]::Synchronized(@{})
+    $Script:ListReady = $false
+
+    $Script:connectScript = @'
+if (-not $Sync.Servers -or $Sync.Servers.Count -eq 0) { $Sync.StatusText = "Atualize a lista primeiro"; return }
+foreach ($cfg in $Sync.Servers) {
+    $Sync.StatusText = "Conectando: $($cfg.Name)"
+    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)"; return }
+}
+$Sync.ConnectedConfig = $null
+$Sync.StatusText = "Falha ao conectar nos servidores listados"
+'@
+
+    $Script:reconnectScript = @'
+# Prioriza os servidores ja validados como estaveis (pool atual)
+$now = [DateTime]::Now
+$pool = @($Sync.Servers | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($BadServers.ContainsKey($k) -and (($now - $BadServers[$k]).TotalMinutes -lt 5)) })
+$pool = @($pool | Sort-Object -Property @{ Expression = { [int]$_.Ping } })
+if ($pool.Count -gt 0) {
+    foreach ($cfg in $pool) {
+        $Sync.StatusText = "Tentando: $($cfg.Name) ($($cfg.Ping)ms)"
+        if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)"; return }
+    }
+}
+
+# Fallback: pool esgotado -> refaz do mesmo modo (filtrado ou nao)
+$Sync.StatusText = "Pool esgotado - refazendo..."
 $all = Get-AllConfigs
-if (-not $all -or $all.Count -eq 0) { $Sync.StatusText = "Nenhum servidor encontrado"; return }
+if (-not $all -or $all.Count -eq 0) { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Nenhum servidor encontrado"; return }
+$all = @($all | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($BadServers.ContainsKey($k) -and (($now - $BadServers[$k]).TotalMinutes -lt 5)) })
 $sorted = Get-ConfigsWithPing -Configs $all
-$Sync.Servers = @($sorted)
-if (-not $sorted -or $sorted.Count -eq 0) { $Sync.StatusText = "Nenhum servidor alcancavel"; return }
-foreach ($cfg in $sorted) {
+if (-not $sorted -or $sorted.Count -eq 0) { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Nenhum servidor alcancavel"; return }
+if ($Sync.Filtered) {
+    $candidates = @(Scan-StableServers -Configs $sorted)
+    Resolve-Countries -Configs $candidates
+    $Sync.Servers = $candidates
+}
+else {
+    Resolve-Countries -Configs $sorted
+    $candidates = @($sorted)
+    $Sync.Servers = $candidates
+}
+foreach ($cfg in $candidates) {
     $Sync.StatusText = "Tentando: $($cfg.Name) ($($cfg.Ping)ms)"
-    if (Start-V2Ray -Config $cfg) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)"; return }
+    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)"; return }
 }
 $Sync.ConnectedConfig = $null
 $Sync.StatusText = "Falhou em todos os servidores"
 '@
 
-    $refreshScript = @'
+    $Script:refreshScript = @'
 $all = Get-AllConfigs
 if (-not $all -or $all.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor encontrado"; return }
+$now = [DateTime]::Now
+$all = @($all | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($BadServers.ContainsKey($k) -and (($now - $BadServers[$k]).TotalMinutes -lt 5)) })
 $sorted = Get-ConfigsWithPing -Configs $all
+if (-not $sorted -or $sorted.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor alcancavel"; return }
+Resolve-Countries -Configs $sorted
 $Sync.Servers = @($sorted)
-$Sync.StatusText = "Encontrados $($sorted.Count) servidores"
+$Sync.Filtered = $false
+$Sync.StatusText = "Encontrados $($sorted.Count) servidores (sem filtro)"
 '@
 
-    $connectSelectedScript = @'
+    $Script:filterScript = @'
+$all = Get-AllConfigs
+if (-not $all -or $all.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor encontrado"; return }
+$now = [DateTime]::Now
+$all = @($all | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($BadServers.ContainsKey($k) -and (($now - $BadServers[$k]).TotalMinutes -lt 5)) })
+$sorted = Get-ConfigsWithPing -Configs $all
+if (-not $sorted -or $sorted.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor alcancavel"; return }
+$stable = @(Scan-StableServers -Configs $sorted)
+Resolve-Countries -Configs $stable
+$Sync.Servers = $stable
+$Sync.Filtered = $true
+if ($stable.Count -gt 0) { $Sync.StatusText = "Estaveis: $($stable.Count)" } else { $Sync.StatusText = "Nenhum servidor estavel" }
+'@
+
+    $Script:connectSelectedScript = @'
 $idx = $Sync.SelectedIndex
 if ($idx -lt 0 -or $idx -ge $Sync.Servers.Count) { $Sync.StatusText = "Nenhum servidor selecionado"; return }
 $cfg = $Sync.Servers[$idx]
 $Sync.StatusText = "Conectando: $($cfg.Name)"
-if (Start-V2Ray -Config $cfg) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)" }
+if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)" }
 else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $($cfg.Name)" }
 '@
 
+    $Script:tunToggleScript = @'
+$cfg = $Sync.ConnectedConfig
+if (-not $cfg) {
+    $Sync.StatusText = if ($Sync.TunEnabled) { "Modo TUN ativado (aplica ao conectar)" } else { "Modo TUN desativado" }
+    return
+}
+$Sync.StatusText = if ($Sync.TunEnabled) { "Reconectando com TUN..." } else { "Reconectando sem TUN..." }
+if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) {
+    $Sync.ConnectedConfig = $cfg
+    $Sync.StatusText = if ($Sync.TunEnabled) { "Conectado (TUN ON)" } else { "Conectado (TUN OFF)" }
+}
+else {
+    $Sync.ConnectedConfig = $null
+    $Sync.StatusText = "Falha ao reconectar com modo TUN"
+}
+'@
+
     $Script:GuiBtnConnect.Add_Click({
-        $Script:GuiLblLog.Text = "Carregando servidores..."
+        $Script:GuiLblLog.Text = "Conectando..."
+        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog "Proxy do sistema desativado" "WARN" }
         Add-GuiLog "Conectando (menor ping)..." "INFO"
-        Invoke-Background -OpScript $connectScript -OnComplete {
+        Invoke-Background -OpScript $Script:connectScript -OnComplete {
             Update-GuiStatus; Populate-ServerList
             if ($Script:GuiSync.ConnectedConfig) {
                 Add-GuiLog "Conectado: $($Script:GuiSync.ConnectedConfig.Name)" "OK"
@@ -533,10 +788,27 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
 
     $Script:GuiBtnChange.Add_Click({
         $Script:GuiLblLog.Text = "Atualizando servidores..."
-        Add-GuiLog "Atualizando servidores..." "INFO"
-        Invoke-Background -OpScript $refreshScript -OnComplete {
+        Add-GuiLog "Atualizando servidores (sem teste)..." "INFO"
+        Invoke-Background -OpScript $Script:refreshScript -OnComplete {
             Populate-ServerList
+            $Script:ListReady = $true
+            Set-GuiBusy $false
             Add-GuiLog "$($Script:GuiSync.Servers.Count) servidores encontrados" "OK"
+        }
+    })
+
+    $Script:GuiBtnFilter.Add_Click({
+        $Script:GuiLblLog.Text = "Filtrando servidores..."
+        $Script:GuiSync.Progress = 0
+        $Script:GuiSync.ScanTotal = 0
+        $Script:GuiSync.ScanTested = 0
+        $Script:GuiSync.ScanStart = [DateTime]::MinValue
+        Add-GuiLog "Filtrando (teste de estabilidade)..." "INFO"
+        Invoke-Background -OpScript $Script:filterScript -OnComplete {
+            Populate-ServerList
+            $Script:ListReady = $true
+            Set-GuiBusy $false
+            Add-GuiLog "$($Script:GuiSync.Servers.Count) servidores estaveis" "OK"
         }
     })
 
@@ -544,8 +816,9 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
         $idx = $Script:GuiLstServers.SelectedIndex
         if ($idx -lt 0) { $Script:GuiLblLog.Text = "Selecione um servidor na lista"; return }
         $Script:GuiSync.SelectedIndex = $idx
+        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog "Proxy do sistema desativado" "WARN" }
         Add-GuiLog "Conectando: $($Script:GuiSync.Servers[$idx].Name)" "INFO"
-        Invoke-Background -OpScript $connectSelectedScript -OnComplete {
+        Invoke-Background -OpScript $Script:connectSelectedScript -OnComplete {
             Update-GuiStatus
             if ($Script:GuiSync.ConnectedConfig) {
                 Add-GuiLog "Conectado: $($Script:GuiSync.ConnectedConfig.Name)" "OK"
@@ -557,6 +830,8 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
     })
 
     $Script:GuiBtnDisconnect.Add_Click({
+        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog "Proxy do sistema desativado" "WARN" }
+        if ($Script:GuiSync.TunEnabled) { $Script:GuiSync.TunEnabled = $false; Update-TunButton; Add-GuiLog "Modo TUN desativado" "WARN" }
         Stop-V2Ray
         $Script:GuiSync.ConnectedConfig = $null
         Update-GuiStatus
@@ -565,21 +840,69 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
     })
 
     $Script:GuiBtnProxy.Add_Click({
-        Toggle-SystemProxy
-        Update-ProxyButton
         if ($Script:ProxyActive) {
-            Add-GuiLog "Proxy do sistema ativado (HTTP 10809 / SOCKS5 10808)" "OK"
+            Disable-SystemProxy
+            Update-ProxyButton
+            Add-GuiLog "Proxy do sistema desativado" "WARN"
         }
         else {
-            Add-GuiLog "Proxy do sistema desativado" "WARN"
+            if ($Script:GuiSync.TunEnabled) {
+                $Script:GuiSync.TunEnabled = $false
+                Update-TunButton
+                Add-GuiLog "Modo TUN desativado (proxy ativo)" "WARN"
+            }
+            Enable-SystemProxy
+            Update-ProxyButton
+            Add-GuiLog "Proxy do sistema ativado (HTTP 10809 / SOCKS5 10808)" "OK"
+            Add-GuiLog "Voz do Discord (UDP) ignora proxy - use o modo TUN" "WARN"
+            if ($Script:GuiSync.ConnectedConfig) {
+                Invoke-Background -OpScript $Script:tunToggleScript -OnComplete { Update-GuiStatus }
+            }
         }
     })
 
+    $Script:GuiBtnTun.Add_Click({
+        $Script:GuiSync.TunEnabled = -not $Script:GuiSync.TunEnabled
+        Update-TunButton
+        if ($Script:GuiSync.TunEnabled) {
+            if ($Script:ProxyActive) {
+                Disable-SystemProxy
+                Update-ProxyButton
+                Add-GuiLog "Proxy desativado (TUN cobre toda a rede)" "WARN"
+            }
+            Add-GuiLog "Modo TUN ativado - roteia toda a rede (requer admin)" "OK"
+        }
+        else {
+            Add-GuiLog "Modo TUN desativado" "WARN"
+        }
+        Invoke-Background -OpScript $Script:tunToggleScript -OnComplete {
+            Update-GuiStatus
+            if ($Script:GuiSync.ConnectedConfig) {
+                Add-GuiLog "Conectado (TUN $(if ($Script:GuiSync.TunEnabled) { 'ON' } else { 'OFF' }))" "OK"
+            }
+        }
+    })
+
+    $Script:GuiBtnInfoProxy.Add_Click({
+        [System.Windows.MessageBox]::Show(
+            "Proxy do sistema`n`nConfigura o proxy HTTP/SOCKS do Windows. Só os apps que respeitam o proxy do sistema passam pela VPN (navegador, Discord texto/API).`n`nApps que usam UDP/WebRTC (voz do Discord, jogos) IGNORAM o proxy e vão direto. Para rotear tudo, use o Modo TUN.",
+            "Proxy do sistema",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Information)
+    })
+
+    $Script:GuiBtnInfoTun.Add_Click({
+        [System.Windows.MessageBox]::Show(
+            "Modo TUN`n`nCria um adaptador de rede virtual e roteia TODO o tráfego do sistema pela VPN — incluindo voz do Discord (UDP/WebRTC), jogos e apps que ignoram proxy.`n`nDiferença: o Proxy do sistema só pega apps que respeitam proxy; o TUN pega tudo.`n`nRequer executar como administrador.",
+            "Modo TUN",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Information)
+    })
+
     $btnClose.Add_Click({
-        $Script:GuiTimer.Stop()
-        Stop-V2Ray
-        if ($Script:ProxyActive) { Disable-SystemProxy }
-        $Script:GuiWindow.Close()
+        $Script:GuiWindow.Hide()
+        $Script:GuiWindow.ShowInTaskbar = $false
+        $Script:TrayIcon.ShowBalloonTip(3000, "SETT VPN", "Continua rodando na bandeja. A conexao permanece ativa.", [System.Windows.Forms.ToolTipIcon]::Info)
     })
 
     $btnMin.Add_Click({
@@ -595,6 +918,33 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
     $Script:GuiTimer = New-Object System.Windows.Threading.DispatcherTimer
     $Script:GuiTimer.Interval = [TimeSpan]::FromMilliseconds(150)
     $Script:GuiTimer.Add_Tick({
+        # Progress bar
+        if ($Script:GuiPbScan) {
+            $p = [int]$Script:GuiSync.Progress
+            $Script:GuiPbScan.Value = $p
+            if ($Script:GuiLblProgress) {
+                $total = [int]$Script:GuiSync.ScanTotal
+                if ($p -gt 0 -and $p -lt 100 -and $total -gt 0) {
+                    $elapsed = 0.0
+                    $ss = $Script:GuiSync.ScanStart
+                    if ($ss -and $ss -ne [DateTime]::MinValue) {
+                        $elapsed = ((Get-Date) - $ss).TotalSeconds
+                    }
+                    $remaining = Get-ScanRemainingSeconds -ElapsedSeconds $elapsed
+                    $txt = "$p%"
+                    if ($remaining -ge 60) {
+                        $txt += " - restante ~$([int]($remaining/60))m$($remaining % 60)s"
+                    }
+                    else {
+                        $txt += " - restante ~${remaining}s"
+                    }
+                    $Script:GuiLblProgress.Text = $txt
+                }
+                elseif ($p -ge 100) { $Script:GuiLblProgress.Text = "100%" }
+                else { $Script:GuiLblProgress.Text = "" }
+            }
+        }
+
         if ($Script:GuiSync.State -eq "working") {
             $Script:GuiLblLog.Text = $Script:GuiSync.StatusText
             if ($Script:GuiSync.Handle -and $Script:GuiSync.Handle.IsCompleted) {
@@ -614,13 +964,83 @@ else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $
     })
     $Script:GuiTimer.Start()
 
+    # Health check: revalida o tunel a cada ~15s quando conectado
+    $Script:HealthTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $Script:HealthTimer.Interval = [TimeSpan]::FromSeconds(5)
+    $Script:HealthTimer.Add_Tick({
+        if ($Script:HealthHandle -and $Script:HealthHandle.IsCompleted) {
+            try { $Script:HealthPs.EndInvoke($Script:HealthHandle) } catch {}
+            if ($Script:HealthRs) { try { $Script:HealthRs.Dispose() } catch {} }
+            if ($Script:HealthPs) { try { $Script:HealthPs.Dispose() } catch {} }
+            $Script:HealthHandle = $null
+            $Script:HealthPs = $null
+            $Script:HealthRs = $null
+
+            if ($Script:HealthSync.Result -eq $false -and $Script:GuiSync.ConnectedConfig) {
+                $dropped = $Script:GuiSync.ConnectedConfig
+                $Script:BadServers["$($dropped.Host):$($dropped.Port)"] = [DateTime]::Now
+                $Script:GuiSync.ConnectedConfig = $null
+                Update-GuiStatus
+                Add-GuiLog "TUNEL CAIU - reconectando..." "ERROR"
+                Show-GuiWindow
+                Invoke-Background -OpScript $Script:reconnectScript -OnComplete {
+                    Update-GuiStatus; Populate-ServerList
+                    if ($Script:GuiSync.ConnectedConfig) {
+                        Add-GuiLog "Reconectado: $($Script:GuiSync.ConnectedConfig.Name)" "OK"
+                    }
+                    else {
+                        Add-GuiLog "Falha ao reconectar" "ERROR"
+                    }
+                }
+            }
+        }
+
+        if ($Script:GuiSync.ConnectedConfig -and -not $Script:HealthHandle -and ($Script:GuiSync.State -ne "working")) {
+            if ([DateTime]::Now -ge $Script:LastHealthCheck.AddSeconds(15)) {
+                $Script:LastHealthCheck = [DateTime]::Now
+                Start-GuiHealthCheck
+            }
+        }
+    })
+    $Script:HealthTimer.Start()
+
+    # Balão de aviso no início (deixa claro que o app ficou na bandeja)
+    $Script:BalloonTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $Script:BalloonTimer.Interval = [TimeSpan]::FromSeconds(1)
+    $Script:BalloonTimer.Add_Tick({
+        $Script:BalloonTimer.Stop()
+        if ($Script:TrayIcon) {
+            $Script:TrayIcon.ShowBalloonTip(4000, "SETT VPN", "Rodando na bandeja. Feche a janela para continuar em segundo plano.", [System.Windows.Forms.ToolTipIcon]::Info)
+        }
+    })
+    $Script:BalloonTimer.Start()
+
     Update-GuiStatus
     Update-ProxyButton
-    Add-GuiLog "Pronto" "INFO"
+    Update-TunButton
+    Set-GuiBusy $false
+    Add-GuiLog "Pronto. Atualize os servidores." "INFO"
 
-    $Script:GuiWindow.ShowDialog() | Out-Null
+    $Script:MainFrame = New-Object System.Windows.Threading.DispatcherFrame
+    $Script:GuiWindow.Show()
+
+    # Força o ícone nativo da janela (barra de tarefas) via WM_SETICON
+    try {
+        $helper = New-Object System.Windows.Interop.WindowInteropHelper($Script:GuiWindow)
+        $hwnd = $helper.Handle
+        if ($hwnd -ne [IntPtr]::Zero -and $Script:AppIcon) {
+            [SettVPNNative]::SendMessage($hwnd, 0x80, [IntPtr]1, $Script:AppIcon.Handle) | Out-Null
+            [SettVPNNative]::SendMessage($hwnd, 0x80, [IntPtr]0, $Script:AppIcon.Handle) | Out-Null
+        }
+    }
+    catch { }
+
+    [System.Windows.Threading.Dispatcher]::PushFrame($Script:MainFrame)
 
     if ($Script:GuiTimer) { $Script:GuiTimer.Stop() }
+    if ($Script:HealthTimer) { $Script:HealthTimer.Stop() }
+    if ($Script:TrayIcon) { try { $Script:TrayIcon.Visible = $false; $Script:TrayIcon.Dispose() } catch {} }
+    if ($Script:AppIcon) { try { $Script:AppIcon.Dispose() } catch {} }
     Stop-V2Ray
     if ($Script:ProxyActive) { Disable-SystemProxy }
 }

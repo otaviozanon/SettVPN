@@ -1,7 +1,9 @@
 using System;
-using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Threading;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
 
 class SettVPNLauncher
 {
@@ -16,6 +18,7 @@ class SettVPNLauncher
     };
 
     static string V2RayResource = "v2ray.exe";
+    static string WintunResource = "wintun.dll";
 
     static Stream GetResourceStream(string suffix)
     {
@@ -60,6 +63,7 @@ class SettVPNLauncher
         }
     }
 
+    [STAThread]
     static void Main()
     {
         try
@@ -90,22 +94,43 @@ class SettVPNLauncher
             }
         }
 
+        using (Stream wintun = GetResourceStream(WintunResource))
+        {
+            if (!ExtractTo(wintun, Path.Combine(TempDir, "wintun.dll")))
+            {
+                return;
+            }
+        }
+
         string script = Path.Combine(AppDir, "SettVPN_Full.ps1");
         if (!File.Exists(script))
         {
             return;
         }
 
-        var psi = new ProcessStartInfo();
-        psi.FileName = "powershell.exe";
-        psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"" + script + "\"";
-        psi.WorkingDirectory = AppDir;
-        psi.CreateNoWindow = true;
-        psi.UseShellExecute = false;
+        try
+        {
+            string exePath = Assembly.GetExecutingAssembly().Location;
+            Environment.SetEnvironmentVariable("SETTVPN_EXE", exePath, EnvironmentVariableTarget.Process);
+        }
+        catch
+        {
+        }
 
         try
         {
-            Process.Start(psi);
+            using (Runspace runspace = RunspaceFactory.CreateRunspace())
+            {
+                runspace.ApartmentState = ApartmentState.STA;
+                runspace.Open();
+
+                using (PowerShell ps = PowerShell.Create())
+                {
+                    ps.Runspace = runspace;
+                    ps.AddScript("& '" + script + "'");
+                    ps.Invoke();
+                }
+            }
         }
         catch
         {

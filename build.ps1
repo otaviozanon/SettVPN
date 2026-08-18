@@ -8,6 +8,7 @@ Add-Type -AssemblyName System.Drawing
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $icoPath = Join-Path $root "Build\icon.ico"
 $src     = Join-Path $root "Build\launcher.cs"
+$manifest = Join-Path $root "Build\app.manifest"
 $out     = Join-Path $root "SettVPN.exe"
 
 function Get-IconImage {
@@ -156,22 +157,36 @@ $winIco = Join-Path $root "Core\settvpn.ico"
 Write-SingleIco -Path $winIco -Size 48
 Write-Host "OK: $winIco (window icon)" -ForegroundColor Green
 
-# ---- v2ray-core (baixado no build, nao commitado) ----
-$v2rayVersion = "5.53.0"
-$v2rayZipUrl  = "https://github.com/v2fly/v2ray-core/releases/download/v$v2rayVersion/v2ray-windows-64.zip"
-$v2rayCache   = Join-Path $env:TEMP "SettVPN-build"
-$v2rayExe     = Join-Path $v2rayCache "v2ray.exe"
+# ---- Xray-core (fork do v2ray com suporte a TUN no Windows; baixado no build, nao commitado) ----
+$xrayVersion = "26.3.27"
+$xrayZipUrl  = "https://github.com/XTLS/Xray-core/releases/download/v$xrayVersion/Xray-windows-64.zip"
+$xrayCache   = Join-Path $env:TEMP "SettVPN-build-xray"
+$v2rayExe    = Join-Path $xrayCache "v2ray.exe"      # xray.exe renomeado (mantem compatibilidade com o codigo)
+$wintunDll   = Join-Path $xrayCache "wintun.dll"
 
-if (-not (Test-Path $v2rayExe)) {
-    Write-Host "Baixando v2ray-core v$v2rayVersion..." -ForegroundColor Cyan
-    New-Item -ItemType Directory -Path $v2rayCache -Force | Out-Null
-    $zipPath = Join-Path $v2rayCache "v2ray.zip"
-    Invoke-WebRequest -Uri $v2rayZipUrl -OutFile $zipPath -UseBasicParsing
-    Expand-Archive -Path $zipPath -DestinationPath $v2rayCache -Force
+if (-not (Test-Path $v2rayExe) -or -not (Test-Path $wintunDll)) {
+    Write-Host "Baixando Xray-core v$xrayVersion..." -ForegroundColor Cyan
+    New-Item -ItemType Directory -Path $xrayCache -Force | Out-Null
+    $zipPath = Join-Path $xrayCache "xray.zip"
+    Invoke-WebRequest -Uri $xrayZipUrl -OutFile $zipPath -UseBasicParsing
+    Expand-Archive -Path $zipPath -DestinationPath $xrayCache -Force
     Remove-Item $zipPath -Force
+
+    $xrayExeFound = Get-ChildItem -Path $xrayCache -Recurse -Filter "xray.exe" | Select-Object -First 1
+    $wintunFound  = Get-ChildItem -Path $xrayCache -Recurse -Filter "wintun.dll" | Select-Object -First 1
+    if ($xrayExeFound) {
+        $target = Join-Path $xrayCache "v2ray.exe"
+        if (Test-Path $target) { Remove-Item $target -Force }
+        if ($xrayExeFound.FullName -ne $target) { Copy-Item -LiteralPath $xrayExeFound.FullName -Destination $target -Force }
+    }
+    if ($wintunFound) {
+        $target = Join-Path $xrayCache "wintun.dll"
+        if ($wintunFound.FullName -ne $target) { Copy-Item -LiteralPath $wintunFound.FullName -Destination $target -Force }
+    }
 }
-if (-not (Test-Path $v2rayExe)) { Write-Host "FALHA ao obter v2ray.exe" -ForegroundColor Red; exit 1 }
-Write-Host "OK: v2ray.exe v$v2rayVersion ($([math]::Round((Get-Item $v2rayExe).Length/1MB,1)) MB)" -ForegroundColor Green
+if (-not (Test-Path $v2rayExe)) { Write-Host "FALHA ao obter xray.exe" -ForegroundColor Red; exit 1 }
+if (-not (Test-Path $wintunDll)) { Write-Host "FALHA ao obter wintun.dll" -ForegroundColor Red; exit 1 }
+Write-Host "OK: Xray v$xrayVersion ($([math]::Round((Get-Item $v2rayExe).Length/1MB,1)) MB) + wintun.dll" -ForegroundColor Green
 
 # ---- compila ----
 $csc = "C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"
@@ -185,9 +200,18 @@ if (-not (Test-Path $fullPs1)) { Write-Host "FALTA Core\SettVPN_Full.ps1" -Foreg
 if (-not (Test-Path $guiPs1))  { Write-Host "FALTA Core\SettVPN_Gui.ps1" -ForegroundColor Red; exit 1 }
 if (-not (Test-Path $winIco))  { Write-Host "FALTA Core\settvpn.ico" -ForegroundColor Red; exit 1 }
 
-Write-Host "Compilando SettVPN.exe (self-contained)..." -ForegroundColor Cyan
-& $csc /nologo /target:winexe /win32icon:"$icoPath" /out:"$out" "$src" `
-    /resource:"$fullPs1" /resource:"$guiPs1" /resource:"$winIco" /resource:"$v2rayExe"
+# Referencia do PowerShell (host in-process no exe, para o icone correto na taskbar)
+$psAsm = $null
+try { $psAsm = [System.Management.Automation.PowerShell].Assembly.Location } catch { }
+if (-not $psAsm -or -not (Test-Path $psAsm)) {
+    $psAsm = "C:\Windows\Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation\v4.0_3.0.0.0__31bf3856ad364e35\System.Management.Automation.dll"
+}
+if (-not (Test-Path $psAsm)) { Write-Host "FALTA System.Management.Automation.dll" -ForegroundColor Red; exit 1 }
+
+Write-Host "Compilando SettVPN.exe (self-contained, requer administrador)..." -ForegroundColor Cyan
+& $csc /nologo /target:winexe /win32icon:"$icoPath" /win32manifest:"$manifest" /out:"$out" "$src" `
+    /r:"$psAsm" `
+    /resource:"$fullPs1" /resource:"$guiPs1" /resource:"$winIco" /resource:"$v2rayExe" /resource:"$wintunDll"
 
 if (Test-Path $out) {
     Write-Host "OK: $out" -ForegroundColor Green
