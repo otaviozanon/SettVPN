@@ -717,6 +717,11 @@ function Start-V2Ray {
         Start-Sleep -Seconds 2
 
         if (($Script:V2RayProcess) -and (-not $Script:V2RayProcess.HasExited)) {
+            if (-not (Test-V2RayTunnel)) {
+                Write-Status "Tunnel check failed: $($Config.Name)" "WARN"
+                Stop-V2Ray
+                return $false
+            }
             Write-Status "Connected to VPN: $($Config.Name)" "OK"
             Write-Status "Protocol: $($Config.Protocol) | Server: $($Config.Host):$($Config.Port) | Ping: $($Config.Ping)ms" "INFO"
             Write-Host ""
@@ -761,6 +766,57 @@ function Stop-V2Ray {
 
     # Cleanup any remaining v2ray processes
     Get-Process -Name "v2ray" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Test-V2RayTunnel {
+    param([int]$TimeoutMs = 4000)
+
+    $targetIp = "1.1.1.1"
+    $targetPort = 443
+
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $client = $null
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $client.ReceiveTimeout = $TimeoutMs
+            $client.SendTimeout = $TimeoutMs
+
+            $ar = $client.BeginConnect("127.0.0.1", 10808, $null, $null)
+            if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.Close(); Start-Sleep -Milliseconds 1200; continue }
+            $client.EndConnect($ar)
+
+            $stream = $client.GetStream()
+
+            # SOCKS5 greeting: no auth
+            $hello = [byte[]](5, 1, 0)
+            $stream.Write($hello, 0, 3)
+            $resp = New-Object byte[] 2
+            if ($stream.Read($resp, 0, 2) -lt 2 -or $resp[1] -ne 0) { $client.Close(); Start-Sleep -Milliseconds 1200; continue }
+
+            # CONNECT 1.1.1.1:443
+            $addr = [System.Net.IPAddress]::Parse($targetIp).GetAddressBytes()
+            $portBytes = [BitConverter]::GetBytes([UInt16]$targetPort)
+            [Array]::Reverse($portBytes)
+
+            $req = New-Object byte[] 10
+            $req[0] = 5; $req[1] = 1; $req[2] = 0; $req[3] = 1
+            [Array]::Copy($addr, 0, $req, 4, 4)
+            $req[8] = $portBytes[0]; $req[9] = $portBytes[1]
+            $stream.Write($req, 0, 10)
+
+            $reply = New-Object byte[] 10
+            if ($stream.Read($reply, 0, 10) -lt 2) { $client.Close(); Start-Sleep -Milliseconds 1200; continue }
+
+            $ok = ($reply[0] -eq 5 -and $reply[1] -eq 0)
+            $client.Close()
+            if ($ok) { return $true }
+        }
+        catch {
+            if ($client) { try { $client.Close() } catch {} }
+        }
+        Start-Sleep -Milliseconds 1200
+    }
+    return $false
 }
 
 function Get-V2RayStatus {
