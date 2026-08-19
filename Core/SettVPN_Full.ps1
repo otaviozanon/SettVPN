@@ -808,9 +808,13 @@ function Scan-StableServers {
             Write-Status "Descartado: $(Get-ShortName $cfg.Name)" "WARN"
         }
         # ETA adaptativo: media real de tempo por servidor x servidores restantes
+        # Deadline so anda pra frente (timer nunca volta a subir).
         if ($Sync) {
             $eta = Get-ScanEtaSeconds -ElapsedSeconds $scanSw.Elapsed.TotalSeconds -Total $total -Tested $tested
-            $Sync.ScanDeadline = [DateTime]::Now.AddSeconds($eta)
+            $newDeadline = [DateTime]::Now.AddSeconds($eta)
+            if ($Sync.ScanDeadline -eq [DateTime]::MinValue -or $newDeadline -lt $Sync.ScanDeadline) {
+                $Sync.ScanDeadline = $newDeadline
+            }
         }
     }
     if ($Sync) { $Sync.Progress = 100; $Sync.ScanDeadline = [DateTime]::Now }
