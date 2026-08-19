@@ -126,6 +126,111 @@ $jsonNoTun = Get-Content $Script:ConfigJson -Raw | ConvertFrom-Json
 $noTun = @($jsonNoTun.inbounds | Where-Object { $_.protocol -eq 'tun' }).Count -eq 0
 Assert-True $noTun 'Config sem TUN nao contem inbound tun'
 
+Write-Host "`n== ParamHash / ParamValue / Unescape-Safe ==" -ForegroundColor Cyan
+
+$ph = ConvertTo-ParamHashtable -Params 'security=tls&type=ws&sni=example.com'
+Assert-Equal $ph['security'] 'tls' 'ParamHash security'
+Assert-Equal $ph['type'] 'ws' 'ParamHash type'
+Assert-Equal $ph['sni'] 'example.com' 'ParamHash sni'
+Assert-Equal ((ConvertTo-ParamHashtable -Params '').Count) 0 'ParamHash vazio'
+Assert-Equal (Get-ParamValue $ph 'type') 'ws' 'ParamValue presente'
+Assert-Equal (Get-ParamValue $ph 'missing' 'def') 'def' 'ParamValue default'
+Assert-Equal (Unescape-Safe 'a%20b') 'a b' 'Unescape-Safe decodifica'
+
+Write-Host "`n== Get-ShortName ==" -ForegroundColor Cyan
+
+Assert-Equal (Get-ShortName -Name 'curto') 'curto' 'ShortName curto'
+Assert-Equal (Get-ShortName -Name '') '' 'ShortName vazio'
+$longName = ('x' * 40)
+$sn = Get-ShortName -Name $longName
+Assert-True ($sn.Length -le 26) 'ShortName longo trunca (<=26)'
+Assert-True ($sn.EndsWith('...')) 'ShortName termina com ...'
+
+Write-Host "`n== Test-CloudflareIp ==" -ForegroundColor Cyan
+
+Assert-True (Test-CloudflareIp -IpString '104.16.5.6') 'Cloudflare 104.16.x'
+Assert-True (Test-CloudflareIp -IpString '104.31.255.255') 'Cloudflare 104.31.x'
+Assert-True (Test-CloudflareIp -IpString '172.64.1.1') 'Cloudflare 172.64.x'
+Assert-True (Test-CloudflareIp -IpString '172.71.1.1') 'Cloudflare 172.71.x'
+Assert-True (Test-CloudflareIp -IpString '162.159.1.1') 'Cloudflare 162.159.x'
+Assert-True (Test-CloudflareIp -IpString '173.245.1.1') 'Cloudflare 173.245.x'
+Assert-True (Test-CloudflareIp -IpString '141.101.1.1') 'Cloudflare 141.101.x'
+Assert-True (Test-CloudflareIp -IpString '188.114.1.1') 'Cloudflare 188.114.x'
+Assert-True (Test-CloudflareIp -IpString '190.93.1.1') 'Cloudflare 190.93.x'
+Assert-True (Test-CloudflareIp -IpString '197.234.1.1') 'Cloudflare 197.234.x'
+Assert-True (Test-CloudflareIp -IpString '198.41.1.1') 'Cloudflare 198.41.x'
+Assert-True (-not (Test-CloudflareIp -IpString '8.8.8.8')) 'Nao-cloudflare 8.8.8.8'
+Assert-True (-not (Test-CloudflareIp -IpString '1.2.3.4')) 'Nao-cloudflare 1.2.3.4'
+
+Write-Host "`n== New-StreamSettings (transports) ==" -ForegroundColor Cyan
+
+$stTcp = New-StreamSettings -P @{}
+Assert-Equal $stTcp.network 'tcp' 'Stream tcp default network'
+Assert-Equal $stTcp.security 'none' 'Stream tcp default security'
+
+$stTls = New-StreamSettings -P @{ security = 'tls'; sni = 'example.com'; alpn = 'h2,http/1.1'; fp = 'chrome' }
+Assert-Equal $stTls.security 'tls' 'Stream tls security'
+Assert-Equal $stTls['tlsSettings']['serverName'] 'example.com' 'Stream tls sni'
+Assert-Equal ($stTls['tlsSettings']['alpn'] -join ',') 'h2,http/1.1' 'Stream tls alpn'
+Assert-Equal $stTls['tlsSettings']['fingerprint'] 'chrome' 'Stream tls fp'
+
+$stRl = New-StreamSettings -P @{ security = 'reality'; sni = 'x'; pbk = 'y'; sid = 'z'; fp = 'chrome'; spx = '/' }
+Assert-Equal $stRl.security 'reality' 'Stream reality security'
+Assert-Equal $stRl['realitySettings']['publicKey'] 'y' 'Stream reality pbk'
+Assert-Equal $stRl['realitySettings']['shortId'] 'z' 'Stream reality sid'
+
+$stWs = New-StreamSettings -P @{ type = 'ws'; path = '/x'; host = 'h' }
+Assert-Equal $stWs.network 'ws' 'Stream ws network'
+Assert-Equal $stWs['wsSettings']['path'] '/x' 'Stream ws path'
+Assert-Equal $stWs['wsSettings']['headers']['Host'] 'h' 'Stream ws host'
+
+$stGrpc = New-StreamSettings -P @{ type = 'grpc'; serviceName = 'svc' }
+Assert-Equal $stGrpc.network 'grpc' 'Stream grpc network'
+Assert-Equal $stGrpc['grpcSettings']['serviceName'] 'svc' 'Stream grpc serviceName'
+
+$stXh = New-StreamSettings -P @{ type = 'xhttp'; path = '/'; host = 'h'; mode = 'auto' }
+Assert-Equal $stXh.network 'xhttp' 'Stream xhttp network'
+Assert-Equal $stXh['xhttpSettings']['mode'] 'auto' 'Stream xhttp mode'
+
+Write-Host "`n== Filtro vmess (Test-ConfigStable) ==" -ForegroundColor Cyan
+
+Assert-True (Test-ConfigStable -Config @{ Protocol = 'vmess'; Network = 'tcp'; Host = 'x.com' }) 'vmess+tcp aceito'
+Assert-True (-not (Test-ConfigStable -Config @{ Protocol = 'vmess'; Network = 'ws'; Host = 'x.com' })) 'vmess+ws rejeitado'
+
+Write-Host "`n== Geracao de config (trojan/ss/vmess) ==" -ForegroundColor Cyan
+
+$trojanCfg = @{ Protocol = 'trojan'; Host = '1.2.3.4'; Port = 443; Password = 'pw'; Params = ''; Name = 't'; Ping = 50 }
+Assert-True (Generate-V2RayConfig -Config $trojanCfg -Tun $false) 'Gera trojan (retorno true)'
+$jsonTj = Get-Content $Script:ConfigJson -Raw | ConvertFrom-Json
+Assert-Equal $jsonTj.outbounds[0].protocol 'trojan' 'Trojan protocol'
+Assert-Equal $jsonTj.outbounds[0].streamSettings.security 'tls' 'Trojan forca tls'
+
+$ssBad = @{ Protocol = 'shadowsocks'; Host = '1.2.3.4'; Port = 8388; Method = 'unknown'; Password = 'p'; Params = ''; Name = 's'; Ping = 50 }
+Assert-True (-not (Generate-V2RayConfig -Config $ssBad -Tun $false)) 'ss metodo desconhecido -> rejeita'
+
+$ssWs = @{ Protocol = 'shadowsocks'; Host = '1.2.3.4'; Port = 8388; Method = 'aes-256-gcm'; Password = 'p'; Params = 'type=ws'; Name = 's'; Ping = 50 }
+Assert-True (-not (Generate-V2RayConfig -Config $ssWs -Tun $false)) 'ss com transport ws -> rejeita'
+
+$vmessWs = @{ Protocol = 'vmess'; Host = '1.2.3.4'; Port = 443; UUID = '123e4567-e89b-12d3-a456-426614174000'; AlterID = 0; Security = 'auto'; Network = 'ws'; Params = ''; Name = 'v'; Ping = 50 }
+Assert-True (-not (Generate-V2RayConfig -Config $vmessWs -Tun $false)) 'vmess+ws -> rejeita'
+
+$vmessTcp = @{ Protocol = 'vmess'; Host = '1.2.3.4'; Port = 443; UUID = '123e4567-e89b-12d3-a456-426614174000'; AlterID = 0; Security = 'auto'; Network = 'tcp'; Params = ''; Name = 'v'; Ping = 50 }
+Assert-True (Generate-V2RayConfig -Config $vmessTcp -Tun $false) 'vmess+tcp gera (retorno true)'
+$jsonVm = Get-Content $Script:ConfigJson -Raw | ConvertFrom-Json
+Assert-Equal $jsonVm.outbounds[0].protocol 'vmess' 'VMess protocol'
+Assert-Equal $jsonVm.outbounds[0].streamSettings.network 'tcp' 'VMess network tcp'
+
+Write-Host "`n== Geracao de config com portas customizadas (scan paralelo) ==" -ForegroundColor Cyan
+
+$scanCfgPath = Join-Path $Script:TempDir 'config-scan-custom.json'
+Assert-True (Generate-V2RayConfig -Config $vlessCfg -Tun $false -SocksPort 10818 -HttpPort 10819 -ConfigPath $scanCfgPath) 'Gera config com porta custom (retorno true)'
+$jsonScan = Get-Content $scanCfgPath -Raw | ConvertFrom-Json
+$socksIn = @($jsonScan.inbounds | Where-Object { $_.protocol -eq 'socks' })[0]
+$httpIn = @($jsonScan.inbounds | Where-Object { $_.protocol -eq 'http' })[0]
+Assert-Equal $socksIn.port 10818 'Config scan: socks na porta custom'
+Assert-Equal $httpIn.port 10819 'Config scan: http na porta custom'
+Assert-True (Test-Path $scanCfgPath) 'Config scan: arquivo gravado no caminho custom'
+
 Write-Host ''
 Write-Host "Resultado: $($script:Pass) passaram, $($script:Fail) falharam"
 if ($script:Fail -gt 0) { exit 1 } else { exit 0 }

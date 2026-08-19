@@ -12,6 +12,7 @@ $fullPs1 = Join-Path $root 'Core\SettVPN_Full.ps1'
 
 # --- setup dos $Script: usados pelas funcoes ---
 $Script:TempDir = Join-Path $env:TEMP 'SettVPN'
+$Script:ScriptFile = $fullPs1
 $Script:V2RayExe = Join-Path $Script:TempDir 'v2ray.exe'
 $Script:ConfigJson = Join-Path $Script:TempDir 'config.json'
 $Script:ReadmeCache = Join-Path $Script:TempDir 'abc-configs-README.md'

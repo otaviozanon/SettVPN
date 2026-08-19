@@ -22,6 +22,16 @@ jobs:
           .\build.ps1
           if (-not (Test-Path SettVPN.exe)) { throw "Build failed: SettVPN.exe not found" }
 
+      - name: Parse check
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File Tests\parse-check.ps1
+
+      - name: Unit tests
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File Tests\unit-tests.ps1
+
       - name: Package zip
         shell: pwsh
         run: |

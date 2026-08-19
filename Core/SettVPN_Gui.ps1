@@ -58,7 +58,9 @@ function Invoke-Background {
     $worker.Runspace = $rs
 
     $setup = @"
+Set-StrictMode -Version Latest
 `$Script:TempDir = '$($Script:TempDir)'
+`$Script:ScriptFile = '$($Script:ScriptFile)'
 `$Script:V2RayExe = '$($Script:V2RayExe)'
 `$Script:WintunDll = '$($Script:WintunDll)'
 `$Script:ConfigJson = '$($Script:ConfigJson)'
@@ -226,6 +228,7 @@ function Start-GuiHealthCheck {
         $ps.Runspace = $rs
 
         $code = $Script:GuiFuncSource + "`n" + @'
+Set-StrictMode -Version Latest
 $sync = $HealthSyncRef
 $sync.Result = Test-V2RayTunnel
 $sync.Busy = $false
@@ -696,21 +699,9 @@ if ($pool.Count -gt 0) {
 
 # Fallback: pool esgotado -> refaz do mesmo modo (filtrado ou nao)
 $Sync.StatusText = "Pool esgotado - refazendo..."
-$all = Get-AllConfigs
-if (-not $all -or $all.Count -eq 0) { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Nenhum servidor encontrado"; return }
-$all = @($all | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($BadServers.ContainsKey($k) -and (($now - $BadServers[$k]).TotalMinutes -lt 5)) })
-$sorted = Get-ConfigsWithPing -Configs $all
-if (-not $sorted -or $sorted.Count -eq 0) { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Nenhum servidor alcancavel"; return }
-if ($Sync.Filtered) {
-    $candidates = @(Scan-StableServers -Configs $sorted)
-    Resolve-Countries -Configs $candidates
-    $Sync.Servers = $candidates
-}
-else {
-    Resolve-Countries -Configs $sorted
-    $candidates = @($sorted)
-    $Sync.Servers = $candidates
-}
+$candidates = Get-ServerPool -Filtered $Sync.Filtered -BadServers $BadServers
+if (-not $candidates -or $candidates.Count -eq 0) { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Nenhum servidor encontrado"; return }
+$Sync.Servers = $candidates
 foreach ($cfg in $candidates) {
     $Sync.StatusText = "Tentando: $(Get-ShortName $cfg.Name) ($($cfg.Ping)ms)"
     if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $(Get-ShortName $cfg.Name)"; return }
@@ -720,30 +711,19 @@ $Sync.StatusText = "Falhou em todos os servidores"
 '@
 
     $Script:refreshScript = @'
-$all = Get-AllConfigs
-if (-not $all -or $all.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor encontrado"; return }
-$now = [DateTime]::Now
-$all = @($all | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($BadServers.ContainsKey($k) -and (($now - $BadServers[$k]).TotalMinutes -lt 5)) })
-$sorted = Get-ConfigsWithPing -Configs $all
-if (-not $sorted -or $sorted.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor alcancavel"; return }
-Resolve-Countries -Configs $sorted
-$Sync.Servers = @($sorted)
+$pool = Get-ServerPool -BadServers $BadServers
+if (-not $pool -or $pool.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor encontrado"; return }
+$Sync.Servers = $pool
 $Sync.Filtered = $false
-$Sync.StatusText = "Encontrados $($sorted.Count) servidores (sem filtro)"
+$Sync.StatusText = "Encontrados $($pool.Count) servidores (sem filtro)"
 '@
 
     $Script:filterScript = @'
-$all = Get-AllConfigs
-if (-not $all -or $all.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor encontrado"; return }
-$now = [DateTime]::Now
-$all = @($all | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($BadServers.ContainsKey($k) -and (($now - $BadServers[$k]).TotalMinutes -lt 5)) })
-$sorted = Get-ConfigsWithPing -Configs $all
-if (-not $sorted -or $sorted.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor alcancavel"; return }
-$stable = @(Scan-StableServers -Configs $sorted)
-Resolve-Countries -Configs $stable
-$Sync.Servers = $stable
+$pool = Get-ServerPool -Filtered $true -BadServers $BadServers
 $Sync.Filtered = $true
-if ($stable.Count -gt 0) { $Sync.StatusText = "Estaveis: $($stable.Count)" } else { $Sync.StatusText = "Nenhum servidor estavel" }
+if (-not $pool -or $pool.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "Nenhum servidor estavel"; return }
+$Sync.Servers = $pool
+$Sync.StatusText = "Estaveis: $($pool.Count)"
 '@
 
     $Script:connectSelectedScript = @'

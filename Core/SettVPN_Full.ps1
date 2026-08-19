@@ -28,10 +28,7 @@ $Script:Sub2ConfigsUrl = "https://raw.githubusercontent.com/peasoft/NoMoreWalls/
 
 # ============================================================
 # V2RAY - extraido pelo launcher (SettVPN.exe) para %TEMP%\SettVPN\v2ray.exe
-# V2RayBase64 mantido apenas como fallback para execucao direta do script
 # ============================================================
-
-$Script:V2RayBase64 = $null
 
 # ============================================================
 # HELPER FUNCTIONS
@@ -71,23 +68,9 @@ function Extract-V2Ray {
         Write-Status "v2ray.exe already extracted" "INFO"
         return $true
     }
-    
-    if ([string]::IsNullOrEmpty($Script:V2RayBase64)) {
-        Write-Status "v2ray.exe not found and no embedded fallback. Run via SettVPN.exe." "ERROR"
-        return $false
-    }
 
-    try {
-        Write-Status "Extracting v2ray.exe from embedded data..." "INFO"
-        $bytes = [Convert]::FromBase64String($Script:V2RayBase64)
-        [System.IO.File]::WriteAllBytes($Script:V2RayExe, $bytes)
-        Write-Status "v2ray.exe extracted successfully" "OK"
-        return $true
-    }
-    catch {
-        Write-Status "Failed to extract v2ray.exe: $_" "ERROR"
-        return $false
-    }
+    Write-Status "v2ray.exe not found. Run via SettVPN.exe." "ERROR"
+    return $false
 }
 
 # ============================================================
@@ -243,40 +226,38 @@ function Parse-VmessConfig {
 }
 
 function Download-AbcConfigs {
-    # Check cache first - if less than 10 minutes old, use it
-    if (Test-Path $Script:ReadmeCache) {
-        $cacheAge = (Get-Date) - (Get-Item $Script:ReadmeCache).LastWriteTime
+    return Get-CachedContent -Url $Script:AbcConfigsUrl -Cache $Script:ReadmeCache -Label "abc-configs"
+}
+
+function Get-CachedContent {
+    param([string]$Url, [string]$Cache, [string]$Label)
+
+    if (Test-Path $Cache) {
+        $cacheAge = (Get-Date) - (Get-Item $Cache).LastWriteTime
         if ($cacheAge.TotalMinutes -lt 10) {
-            Write-Status "Using cached configs (updated $([math]::Round($cacheAge.TotalMinutes, 1)) min ago)" "INFO"
-            return Get-Content $Script:ReadmeCache -Raw
+            Write-Status "Using cached $Label (updated $([math]::Round($cacheAge.TotalMinutes, 1)) min ago)" "INFO"
+            return Get-Content $Cache -Raw
         }
     }
 
     try {
-        Write-Status "Downloading latest configs from GitHub..." "INFO"
-
-        # Use Invoke-WebRequest with timeout
-        $response = Invoke-WebRequest -Uri $Script:AbcConfigsUrl -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
+        Write-Status "Downloading $Label..." "INFO"
+        $response = Invoke-WebRequest -Uri $Url -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
         $content = $response.Content
 
-        # Cache locally
-        Set-Content -Path $Script:ReadmeCache -Value $content -Encoding UTF8
-        Write-Status "Downloaded and cached latest configs" "OK"
+        Set-Content -Path $Cache -Value $content -Encoding UTF8
+        Write-Status "Downloaded and cached $Label" "OK"
         return $content
     }
     catch {
-        Write-Status "Failed to download from GitHub: $_" "WARN"
+        Write-Status "Failed to download ${Label}: $_" "WARN"
 
-        # Try to use cached version (even if old)
-        if (Test-Path $Script:ReadmeCache) {
-            $cacheAge = (Get-Date) - (Get-Item $Script:ReadmeCache).LastWriteTime
-            Write-Status "Using cached configs (updated $([math]::Round($cacheAge.TotalHours, 1)) hours ago)" "WARN"
-            return Get-Content $Script:ReadmeCache -Raw
+        if (Test-Path $Cache) {
+            $cacheAge = (Get-Date) - (Get-Item $Cache).LastWriteTime
+            Write-Status "Using cached $Label (updated $([math]::Round($cacheAge.TotalHours, 1)) hours ago)" "WARN"
+            return Get-Content $Cache -Raw
         }
-        else {
-            Write-Status "No cached configs available - cannot proceed" "ERROR"
-            return $null
-        }
+        return $null
     }
 }
 
@@ -311,32 +292,7 @@ function Get-ShortName {
 function Download-SubSource {
     param([string]$Url, [string]$Cache, [string]$Label)
 
-    if (Test-Path $Cache) {
-        $cacheAge = (Get-Date) - (Get-Item $Cache).LastWriteTime
-        if ($cacheAge.TotalMinutes -lt 10) {
-            Write-Status "Using cached $($Label) (updated $([math]::Round($cacheAge.TotalMinutes, 1)) min ago)" "INFO"
-            return Get-Content $Cache -Raw
-        }
-    }
-
-    try {
-        Write-Status "Downloading $($Label)..." "INFO"
-        $response = Invoke-WebRequest -Uri $Url -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
-        $encoded = $response.Content
-
-        Set-Content -Path $Cache -Value $encoded -Encoding UTF8
-        Write-Status "Downloaded and cached $($Label)" "OK"
-        return $encoded
-    }
-    catch {
-        Write-Status "Failed to download $($Label): $_" "WARN"
-
-        if (Test-Path $Cache) {
-            Write-Status "Using cached $($Label)" "WARN"
-            return Get-Content $Cache -Raw
-        }
-        return $null
-    }
+    return Get-CachedContent -Url $Url -Cache $Cache -Label $Label
 }
 
 function Get-AllConfigs {
@@ -405,6 +361,33 @@ function Get-AllConfigs {
     }
     Write-Status "Found $($configs.Count) configs (apos filtro)" "INFO"
     return $configs
+}
+
+function Get-ServerPool {
+    param([bool]$Filtered = $false, [hashtable]$BadServers = $null)
+
+    $all = Get-AllConfigs
+    if (-not $all -or $all.Count -eq 0) { return $null }
+
+    if ($BadServers -and $BadServers.Count -gt 0) {
+        $now = [DateTime]::Now
+        $all = @($all | Where-Object {
+            $k = "$($_.Host):$($_.Port)"
+            -not ($BadServers.ContainsKey($k) -and (($now - $BadServers[$k]).TotalMinutes -lt 5))
+        })
+    }
+
+    $sorted = Get-ConfigsWithPing -Configs $all
+    if (-not $sorted -or $sorted.Count -eq 0) { return $null }
+
+    if ($Filtered) {
+        $stable = @(Scan-StableServers -Configs $sorted)
+        Resolve-Countries -Configs $stable
+        return $stable
+    }
+
+    Resolve-Countries -Configs $sorted
+    return @($sorted)
 }
 
 # ============================================================
@@ -589,16 +572,19 @@ function New-StreamSettings {
 }
 
 function Generate-V2RayConfig {
-    param([hashtable]$Config, [bool]$Tun = $false)
+    param([hashtable]$Config, [bool]$Tun = $false, [int]$SocksPort = 10808, [int]$HttpPort = 10809, [string]$ConfigPath = "", [string]$LogPath = "")
+
+    if (-not $ConfigPath) { $ConfigPath = $Script:ConfigJson }
+    if (-not $LogPath) { $LogPath = $Script:XrayLog }
 
     $configObj = @{
         log = @{
             loglevel = "info"
-            error    = $Script:XrayLog
+            error    = $LogPath
         }
         inbounds = @(
             @{
-                port = 10808
+                port = $SocksPort
                 protocol = "socks"
                 settings = @{
                     auth = "noauth"
@@ -606,7 +592,7 @@ function Generate-V2RayConfig {
                 }
             },
             @{
-                port = 10809
+                port = $HttpPort
                 protocol = "http"
                 settings = @{}
             }
@@ -697,6 +683,11 @@ function Generate-V2RayConfig {
         $configObj.outbounds += $outbound
     }
     elseif ($Config.Protocol -eq "vmess") {
+        $net = [string]$Config.Network
+        if ($net -and $net -ne "tcp") {
+            Write-Status "Skipping unsupported VMess transport: $net" "WARN"
+            return $false
+        }
         $outbound = @{
             protocol = "vmess"
             settings = @{
@@ -715,7 +706,7 @@ function Generate-V2RayConfig {
                 )
             }
             streamSettings = @{
-                network = $Config.Network
+                network = if ($net) { $net } else { "tcp" }
             }
         }
         $configObj.outbounds += $outbound
@@ -724,8 +715,8 @@ function Generate-V2RayConfig {
     # Save to file
     try {
         $json = $configObj | ConvertTo-Json -Depth 10 -Compress
-        [System.IO.File]::WriteAllText($Script:ConfigJson, $json, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Status "Generated v2ray config: $Script:ConfigJson" "OK"
+        [System.IO.File]::WriteAllText($ConfigPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Status "Generated v2ray config: $ConfigPath" "OK"
         return $true
     }
     catch {
@@ -768,11 +759,83 @@ function Test-ConfigStable {
         if ($params -match 'type=(grpc|xhttp)') { return $false }
     }
 
+    # VMess guarda o transport em Network (nao em Params); so tcp e suportado.
+    if ($Config['Protocol'] -eq 'vmess') {
+        $net = [string]$Config['Network']
+        if ($net -and $net -ne 'tcp') { return $false }
+    }
+
     return $true
 }
 
+function Get-FuncSource {
+    # Reconstroi o codigo-fonte das funcoes (p/ redefinir em runspaces paralelos).
+    $tokens = $null; $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Script:ScriptFile, [ref]$tokens, [ref]$errs)
+    $funcs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+    return (($funcs | ForEach-Object { $_.Extent.Text }) -join "`n`n")
+}
+
+function Test-ServerStable {
+    param([hashtable]$Config, [int]$SocksPort = 10808, [int]$HttpPort = 10809, [string]$ConfigPath = "", [string]$LogPath = "", [int]$StabilitySeconds = 6)
+
+    # Teste isolado (porta/config/processo proprios) - nao toca em $Script:V2RayProcess/CurrentConfig.
+    if (-not $ConfigPath) { $ConfigPath = Join-Path $Script:TempDir "config-scan-$SocksPort.json" }
+    if (-not $LogPath) { $LogPath = Join-Path $Script:TempDir "xray-scan-$SocksPort.log" }
+
+    if (-not (Generate-V2RayConfig -Config $Config -Tun $false -SocksPort $SocksPort -HttpPort $HttpPort -ConfigPath $ConfigPath -LogPath $LogPath)) {
+        return $false
+    }
+
+    $proc = $null
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Script:V2RayExe
+        $psi.Arguments = "run -c `"$ConfigPath`""
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+
+        # 1) prontidao: espera o tunel responder (poll ate ~6s, sem sleep cego)
+        $ready = $false
+        $deadline = [DateTime]::UtcNow.AddSeconds(6)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if ($proc.HasExited) { break }
+            if (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500 -SocksPort $SocksPort) { $ready = $true; break }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $ready) { return $false }
+
+        # 2) estabilidade: multiplas checagens espacadas
+        $checks = [Math]::Max(1, [int]($StabilitySeconds / 2))
+        for ($i = 0; $i -lt $checks; $i++) {
+            Start-Sleep -Seconds 1
+            if ($proc.HasExited) { return $false }
+            if (-not (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500 -SocksPort $SocksPort)) { return $false }
+        }
+
+        # 3) UDP (Discord/voz, jogos, DNS usam UDP)
+        return (Test-V2RayUdp -TimeoutMs 2500 -SocksPort $SocksPort)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($proc) {
+            try {
+                if (-not $proc.HasExited) { $proc.Kill(); [void]$proc.WaitForExit(3000) }
+                $proc.Dispose()
+            }
+            catch { }
+        }
+    }
+}
+
 function Scan-StableServers {
-    param([array]$Configs, [int]$MaxToTest = 25, [int]$StabilitySeconds = 6, [int]$MinStable = 10)
+    param([array]$Configs, [int]$MaxToTest = 25, [int]$StabilitySeconds = 6, [int]$MinStable = 10, [int]$Concurrency = 5)
 
     $stable = @()
     $tested = 0
@@ -783,16 +846,75 @@ function Scan-StableServers {
         $Sync.ScanTotal = $total; $Sync.ScanTested = 0; $Sync.ScanStart = [DateTime]::Now
         $Sync.ScanDeadline = [DateTime]::Now.AddSeconds($total * 30)
     }
-    foreach ($cfg in $Configs) {
-        if ($tested -ge $MaxToTest) { break }
-        $tested++
-        if ($Sync) { $Sync.ScanTested = $tested; $Sync.Progress = [int](($tested / $total) * 100) }
-        Write-Status "Testando estabilidade ($tested/$total): $(Get-ShortName $cfg.Name)" "INFO"
-        if (Start-V2Ray -Config $cfg -StabilitySeconds $StabilitySeconds) {
-            # Exige UDP alem de TCP (Discord/voz, jogos, DNS usam UDP)
-            $udpOk = Test-V2RayUdp
-            Stop-V2Ray
-            if ($udpOk) {
+
+    $funcSource = Get-FuncSource
+    $offset = 0
+    while ($offset -lt $total -and ($MinStable -le 0 -or $stable.Count -lt $MinStable)) {
+        $batch = @()
+        for ($j = 0; $j -lt $Concurrency -and ($offset + $j) -lt $total; $j++) {
+            $batch += $Configs[$offset + $j]
+        }
+        if ($batch.Count -eq 0) { break }
+
+        # Sobe N instancias de xray em runspaces paralelos (cada uma com porta propria)
+        $results = [hashtable]::Synchronized(@{})
+        $handles = @()
+        $powershells = @()
+        $runspaces = @()
+        for ($j = 0; $j -lt $batch.Count; $j++) {
+            $socks = 10808 + ($j * 10)
+            $http = $socks + 1
+
+            $rs = [runspacefactory]::CreateRunspace()
+            $rs.Open()
+            $rs.SessionStateProxy.SetVariable('scanFuncSource', $funcSource)
+            $rs.SessionStateProxy.SetVariable('scanCfg', $batch[$j])
+            $rs.SessionStateProxy.SetVariable('scanSocks', $socks)
+            $rs.SessionStateProxy.SetVariable('scanHttp', $http)
+            $rs.SessionStateProxy.SetVariable('scanStab', $StabilitySeconds)
+            $rs.SessionStateProxy.SetVariable('scanResults', $results)
+            $rs.SessionStateProxy.SetVariable('scanSlot', $j)
+            $rs.SessionStateProxy.SetVariable('scanTempDir', $Script:TempDir)
+            $rs.SessionStateProxy.SetVariable('scanV2RayExe', $Script:V2RayExe)
+
+            $ps = [powershell]::Create()
+            $ps.Runspace = $rs
+            [void]$ps.AddScript(@'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Continue'
+$Script:TempDir = $scanTempDir
+$Script:V2RayExe = $scanV2RayExe
+Invoke-Expression $scanFuncSource
+function Write-Status { param([string]$Message, [string]$Type = 'INFO') }
+$scanResults[$scanSlot] = Test-ServerStable -Config $scanCfg -SocksPort $scanSocks -HttpPort $scanHttp -StabilitySeconds $scanStab
+'@)
+            $handles += $ps.BeginInvoke()
+            $powershells += $ps
+            $runspaces += $rs
+        }
+
+        # Espera todos do lote terminarem
+        $done = $false
+        while (-not $done) {
+            $done = $true
+            foreach ($h in $handles) {
+                if (-not $h.IsCompleted) { $done = $false; break }
+            }
+            if (-not $done) { Start-Sleep -Milliseconds 100 }
+        }
+        for ($j = 0; $j -lt $handles.Count; $j++) {
+            try { $powershells[$j].EndInvoke($handles[$j]) } catch { }
+        }
+        foreach ($rs in $runspaces) { try { $rs.Dispose() } catch { } }
+        foreach ($ps in $powershells) { try { $ps.Dispose() } catch { } }
+
+        # Coleta resultados na ordem do lote
+        for ($j = 0; $j -lt $batch.Count; $j++) {
+            $tested++
+            $cfg = $batch[$j]
+            if ($Sync) { $Sync.ScanTested = $tested; $Sync.Progress = [int](($tested / $total) * 100) }
+
+            if ($results.ContainsKey($j) -and $results[$j]) {
                 $stable += $cfg
                 Write-Status "Estavel (TCP+UDP): $(Get-ShortName $cfg.Name)" "OK"
                 if ($MinStable -gt 0 -and $stable.Count -ge $MinStable) {
@@ -801,21 +923,20 @@ function Scan-StableServers {
                 }
             }
             else {
-                Write-Status "Sem UDP (descartado): $(Get-ShortName $cfg.Name)" "WARN"
+                Write-Status "Descartado: $(Get-ShortName $cfg.Name)" "WARN"
+            }
+
+            # ETA adaptativo: media real de tempo por servidor x servidores restantes
+            if ($Sync) {
+                $eta = Get-ScanEtaSeconds -ElapsedSeconds $scanSw.Elapsed.TotalSeconds -Total $total -Tested $tested
+                $newDeadline = [DateTime]::Now.AddSeconds($eta)
+                if ($Sync.ScanDeadline -eq [DateTime]::MinValue -or $newDeadline -lt $Sync.ScanDeadline) {
+                    $Sync.ScanDeadline = $newDeadline
+                }
             }
         }
-        else {
-            Write-Status "Descartado: $(Get-ShortName $cfg.Name)" "WARN"
-        }
-        # ETA adaptativo: media real de tempo por servidor x servidores restantes
-        # Deadline so anda pra frente (timer nunca volta a subir).
-        if ($Sync) {
-            $eta = Get-ScanEtaSeconds -ElapsedSeconds $scanSw.Elapsed.TotalSeconds -Total $total -Tested $tested
-            $newDeadline = [DateTime]::Now.AddSeconds($eta)
-            if ($Sync.ScanDeadline -eq [DateTime]::MinValue -or $newDeadline -lt $Sync.ScanDeadline) {
-                $Sync.ScanDeadline = $newDeadline
-            }
-        }
+
+        $offset += $batch.Count
     }
     if ($Sync) { $Sync.Progress = 100; $Sync.ScanDeadline = [DateTime]::Now }
     return $stable
@@ -847,30 +968,33 @@ function Get-CountryNamePt {
     param([string]$Code)
 
     if (-not $Code) { return "" }
-    $map = @{
-        'US' = 'Estados Unidos'; 'BR' = 'Brasil'; 'FR' = 'Franca'; 'RU' = 'Russia';
-        'DE' = 'Alemanha'; 'NL' = 'Holanda'; 'GB' = 'Reino Unido'; 'CA' = 'Canada';
-        'JP' = 'Japao'; 'SG' = 'Singapura'; 'HK' = 'Hong Kong'; 'KR' = 'Coreia do Sul';
-        'TR' = 'Turquia'; 'UA' = 'Ucrania'; 'PL' = 'Polonia'; 'SE' = 'Suecia';
-        'IN' = 'India'; 'IT' = 'Italia'; 'ES' = 'Espanha'; 'CH' = 'Suica';
-        'AR' = 'Argentina'; 'CO' = 'Colombia'; 'MX' = 'Mexico'; 'CL' = 'Chile';
-        'PT' = 'Portugal'; 'AT' = 'Austria'; 'BE' = 'Belgica'; 'BG' = 'Bulgaria';
-        'CZ' = 'Republica Tcheca'; 'DK' = 'Dinamarca'; 'FI' = 'Finlandia'; 'GR' = 'Grecia';
-        'HU' = 'Hungria'; 'IE' = 'Irlanda'; 'IL' = 'Israel'; 'NO' = 'Noruega';
-        'RO' = 'Romenia'; 'ZA' = 'Africa do Sul'; 'AU' = 'Australia'; 'NZ' = 'Nova Zelandia';
-        'TW' = 'Taiwan'; 'VN' = 'Vietna'; 'TH' = 'Tailandia'; 'MY' = 'Malasia';
-        'ID' = 'Indonesia'; 'PH' = 'Filipinas'; 'AE' = 'Emirados Arabes'; 'SA' = 'Arabia Saudita';
-        'EG' = 'Egito'; 'NG' = 'Nigeria'; 'KE' = 'Quenia'; 'PK' = 'Paquistao';
-        'BD' = 'Bangladesh'; 'IR' = 'Ira'; 'IQ' = 'Iraque'; 'KZ' = 'Cazaquistao';
-        'GE' = 'Georgia'; 'AM' = 'Armenia'; 'AZ' = 'Azerbaijao'; 'BY' = 'Bielorrussia';
-        'MD' = 'Moldavia'; 'RS' = 'Servia'; 'HR' = 'Croacia'; 'SI' = 'Eslovenia';
-        'SK' = 'Eslovaquia'; 'LT' = 'Lituania'; 'LV' = 'Letonia'; 'EE' = 'Estonia';
-        'CN' = 'China'; 'LU' = 'Luxemburgo'; 'IS' = 'Islandia'; 'CY' = 'Chipre';
-        'MT' = 'Malta'; 'MC' = 'Monaco'; 'LI' = 'Liechtenstein'; 'AD' = 'Andorra';
-        'DO' = 'Republica Dominicana'; 'UY' = 'Uruguai'; 'PY' = 'Paraguai'; 'PE' = 'Peru';
-        'VE' = 'Venezuela'; 'EC' = 'Equador'; 'BO' = 'Bolivia'; 'GT' = 'Guatemala';
-        'CR' = 'Costa Rica'; 'PA' = 'Panama'; 'CU' = 'Cuba'; 'PR' = 'Porto Rico';
+    if (-not (Get-Variable -Name 'CountryMap' -Scope Script -ErrorAction SilentlyContinue)) {
+        $Script:CountryMap = @{
+            'US' = 'Estados Unidos'; 'BR' = 'Brasil'; 'FR' = 'Franca'; 'RU' = 'Russia';
+            'DE' = 'Alemanha'; 'NL' = 'Holanda'; 'GB' = 'Reino Unido'; 'CA' = 'Canada';
+            'JP' = 'Japao'; 'SG' = 'Singapura'; 'HK' = 'Hong Kong'; 'KR' = 'Coreia do Sul';
+            'TR' = 'Turquia'; 'UA' = 'Ucrania'; 'PL' = 'Polonia'; 'SE' = 'Suecia';
+            'IN' = 'India'; 'IT' = 'Italia'; 'ES' = 'Espanha'; 'CH' = 'Suica';
+            'AR' = 'Argentina'; 'CO' = 'Colombia'; 'MX' = 'Mexico'; 'CL' = 'Chile';
+            'PT' = 'Portugal'; 'AT' = 'Austria'; 'BE' = 'Belgica'; 'BG' = 'Bulgaria';
+            'CZ' = 'Republica Tcheca'; 'DK' = 'Dinamarca'; 'FI' = 'Finlandia'; 'GR' = 'Grecia';
+            'HU' = 'Hungria'; 'IE' = 'Irlanda'; 'IL' = 'Israel'; 'NO' = 'Noruega';
+            'RO' = 'Romenia'; 'ZA' = 'Africa do Sul'; 'AU' = 'Australia'; 'NZ' = 'Nova Zelandia';
+            'TW' = 'Taiwan'; 'VN' = 'Vietna'; 'TH' = 'Tailandia'; 'MY' = 'Malasia';
+            'ID' = 'Indonesia'; 'PH' = 'Filipinas'; 'AE' = 'Emirados Arabes'; 'SA' = 'Arabia Saudita';
+            'EG' = 'Egito'; 'NG' = 'Nigeria'; 'KE' = 'Quenia'; 'PK' = 'Paquistao';
+            'BD' = 'Bangladesh'; 'IR' = 'Ira'; 'IQ' = 'Iraque'; 'KZ' = 'Cazaquistao';
+            'GE' = 'Georgia'; 'AM' = 'Armenia'; 'AZ' = 'Azerbaijao'; 'BY' = 'Bielorrussia';
+            'MD' = 'Moldavia'; 'RS' = 'Servia'; 'HR' = 'Croacia'; 'SI' = 'Eslovenia';
+            'SK' = 'Eslovaquia'; 'LT' = 'Lituania'; 'LV' = 'Letonia'; 'EE' = 'Estonia';
+            'CN' = 'China'; 'LU' = 'Luxemburgo'; 'IS' = 'Islandia'; 'CY' = 'Chipre';
+            'MT' = 'Malta'; 'MC' = 'Monaco'; 'LI' = 'Liechtenstein'; 'AD' = 'Andorra';
+            'DO' = 'Republica Dominicana'; 'UY' = 'Uruguai'; 'PY' = 'Paraguai'; 'PE' = 'Peru';
+            'VE' = 'Venezuela'; 'EC' = 'Equador'; 'BO' = 'Bolivia'; 'GT' = 'Guatemala';
+            'CR' = 'Costa Rica'; 'PA' = 'Panama'; 'CU' = 'Cuba'; 'PR' = 'Porto Rico';
+        }
     }
+    $map = $Script:CountryMap
     if ($map.ContainsKey($Code)) { return $map[$Code] }
     return $Code
 }
@@ -889,12 +1013,37 @@ function Get-CountryCodeFromName {
     return ""
 }
 
+function Resolve-DnsParallel {
+    param([string[]]$Hosts)
+
+    $result = @{}
+    if (-not $Hosts -or $Hosts.Count -eq 0) { return $result }
+
+    $pending = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($h in $Hosts) {
+        try {
+            $ar = [System.Net.Dns]::BeginGetHostAddresses($h, $null, $null)
+            $pending.Add(@{ Host = $h; Ar = $ar })
+        }
+        catch { }
+    }
+    foreach ($item in $pending) {
+        try {
+            $addrs = [System.Net.Dns]::EndGetHostAddresses($item.Ar)
+            if ($addrs -and $addrs.Count -gt 0) { $result[$item.Host] = $addrs[0].ToString() }
+        }
+        catch { }
+    }
+    return $result
+}
+
 function Resolve-Countries {
     param([array]$Configs)
 
     if (-not $Configs -or $Configs.Count -eq 0) { return }
 
-    # Garante a chave Country/CountryCode em toda config (strict mode) e tenta inferir pelo nome
+    # Garante a chave Country/CountryCode (strict mode), infere pelo nome e coleta hosts p/ DNS
+    $hosts = @{}
     foreach ($cfg in $Configs) {
         if (-not $cfg.ContainsKey('Country')) { $cfg['Country'] = '' }
         if (-not $cfg.ContainsKey('CountryCode')) { $cfg['CountryCode'] = '' }
@@ -903,7 +1052,17 @@ function Resolve-Countries {
             $cfg['CountryCode'] = $nameCode
             $cfg['Country'] = Get-CountryNamePt -Code $nameCode
         }
+        $srvHost = [string]$cfg.Host
+        if ($srvHost) {
+            $ip = $null
+            if (-not [System.Net.IPAddress]::TryParse($srvHost, [ref]$ip) -and -not $hosts.ContainsKey($srvHost)) {
+                $hosts[$srvHost] = $srvHost
+            }
+        }
     }
+
+    # DNS em paralelo (1 round-trip p/ todos os hosts, em vez de serial)
+    $hostToIp = Resolve-DnsParallel -Hosts @($hosts.Keys)
 
     # Cache em disco: IP -> codigo de pais
     $cachePath = Join-Path $Script:TempDir 'geo-cache.json'
@@ -923,46 +1082,27 @@ function Resolve-Countries {
         catch { $cache = @{} }
     }
 
-    # Resolve host -> IP (com cache DNS por execucao). IPs da Cloudflare (fronted) ficam sem pais.
-    $hostToIp = @{}
+    # IPs sem cache (HashSet: O(1), sem o -notcontains O(n^2) original)
+    $missing = New-Object 'System.Collections.Generic.HashSet[string]'
     foreach ($cfg in $Configs) {
-        $srvHost = [string]$cfg.Host
-        if (-not $srvHost) { continue }
         $ip = $null
-        if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) {
-            $ip = $srvHost
-        }
-        elseif (-not $hostToIp.ContainsKey($srvHost)) {
-            try {
-                $addrs = [System.Net.Dns]::GetHostAddresses($srvHost)
-                if ($addrs -and $addrs.Count -gt 0) { $ip = $addrs[0].ToString() }
-            }
-            catch { $ip = $null }
-            $hostToIp[$srvHost] = $ip
-        }
-        else {
-            $ip = $hostToIp[$srvHost]
-        }
-        if ($ip -and $cache.ContainsKey($ip) -and -not $cfg['Country'] -and -not (Test-CloudflareIp -IpString $ip)) {
+        $srvHost = [string]$cfg.Host
+        if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) { }
+        elseif ($hostToIp.ContainsKey($srvHost)) { $ip = $hostToIp[$srvHost] }
+        if (-not $ip -or $cfg['Country'] -or (Test-CloudflareIp -IpString $ip)) { continue }
+        if ($cache.ContainsKey($ip)) {
             $cfg['CountryCode'] = $cache[$ip]
             $cfg['Country'] = Get-CountryNamePt -Code $cache[$ip]
+        }
+        else {
+            [void]$missing.Add($ip)
         }
     }
 
     # Consulta em lote os IPs sem cache (ip-api.com, ate 100 por chamada)
-    $allIps = @()
-    foreach ($cfg in $Configs) {
-        $srvHost = [string]$cfg.Host
-        $ip = $null
-        if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) { $ip = $srvHost }
-        elseif ($hostToIp.ContainsKey($srvHost)) { $ip = $hostToIp[$srvHost] }
-        if ($ip -and -not $cache.ContainsKey($ip) -and ($allIps -notcontains $ip) -and -not (Test-CloudflareIp -IpString $ip)) {
-            $allIps += $ip
-        }
-    }
-
-    for ($i = 0; $i -lt $allIps.Count; $i += 100) {
-        $chunk = @($allIps[$i..([Math]::Min($i + 99, $allIps.Count - 1))])
+    $missingList = @($missing)
+    for ($i = 0; $i -lt $missingList.Count; $i += 100) {
+        $chunk = @($missingList[$i..([Math]::Min($i + 99, $missingList.Count - 1))])
         try {
             $body = $chunk | ConvertTo-Json
             $resp = Invoke-WebRequest -Uri 'http://ip-api.com/batch?fields=status,query,countryCode' -Method Post -Body $body -ContentType 'application/json' -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
@@ -986,14 +1126,15 @@ function Resolve-Countries {
 
     # Aplica resultado final
     foreach ($cfg in $Configs) {
-        $srvHost = [string]$cfg.Host
+        if ($cfg['Country']) { continue }
         $ip = $null
-        if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) { $ip = $srvHost }
+        $srvHost = [string]$cfg.Host
+        if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) { }
         elseif ($hostToIp.ContainsKey($srvHost)) { $ip = $hostToIp[$srvHost] }
-        if ($ip -and $cache.ContainsKey($ip) -and $cache[$ip] -and -not $cfg['Country'] -and -not (Test-CloudflareIp -IpString $ip)) {
-            $cfg['CountryCode'] = $cache[$ip]
-            $cfg['Country'] = Get-CountryNamePt -Code $cache[$ip]
-        }
+        if (-not $ip -or -not $cache.ContainsKey($ip) -or -not $cache[$ip]) { continue }
+        if (Test-CloudflareIp -IpString $ip) { continue }
+        $cfg['CountryCode'] = $cache[$ip]
+        $cfg['Country'] = Get-CountryNamePt -Code $cache[$ip]
     }
 }
 
@@ -1108,7 +1249,9 @@ function Start-V2Ray {
 }
 
 function Stop-V2Ray {
+    $ownPid = 0
     if ($Script:V2RayProcess) {
+        $ownPid = $Script:V2RayProcess.Id
         try {
             if (-not $Script:V2RayProcess.HasExited) {
                 $Script:V2RayProcess.Kill()
@@ -1125,8 +1268,13 @@ function Stop-V2Ray {
         $Script:CurrentConfig = $null
     }
 
-    # Cleanup any remaining v2ray processes
-    Get-Process -Name "v2ray" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Mata apenas o NOSSO binario (PID rastreado ou caminho exato), nunca v2ray de terceiros.
+    try {
+        Get-Process -Name "v2ray" -ErrorAction SilentlyContinue |
+            Where-Object { ($_.Id -eq $ownPid) -or ($_.Path -eq $Script:V2RayExe) } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    catch { }
 }
 
 function New-TlsClientHello {
@@ -1191,7 +1339,7 @@ function Get-XrayLogTail {
 }
 
 function Test-V2RayTunnel {
-    param([int]$TimeoutMs = 2500, [int]$Attempts = 2)
+    param([int]$TimeoutMs = 2500, [int]$Attempts = 2, [int]$SocksPort = 10808)
 
     # Multiplos alvos (porta 443, pouco bloqueada): dominio valida DNS + roteamento, IP valida roteamento
     $targets = @(
@@ -1208,7 +1356,7 @@ function Test-V2RayTunnel {
                 $client.ReceiveTimeout = $TimeoutMs
                 $client.SendTimeout = $TimeoutMs
 
-                $ar = $client.BeginConnect("127.0.0.1", 10808, $null, $null)
+                $ar = $client.BeginConnect("127.0.0.1", $SocksPort, $null, $null)
                 if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.Close(); continue }
                 $client.EndConnect($ar)
                 $stream = $client.GetStream()
@@ -1300,7 +1448,7 @@ function Build-DnsQuery {
 }
 
 function Test-V2RayUdp {
-    param([int]$TimeoutMs = 2500)
+    param([int]$TimeoutMs = 2500, [int]$SocksPort = 10808)
 
     # Valida UDP atraves do tunel via SOCKS5 UDP ASSOCIATE + DNS para 8.8.8.8:53
     $client = $null
@@ -1309,7 +1457,7 @@ function Test-V2RayUdp {
         $client = New-Object System.Net.Sockets.TcpClient
         $client.ReceiveTimeout = $TimeoutMs
         $client.SendTimeout = $TimeoutMs
-        $ar = $client.BeginConnect("127.0.0.1", 10808, $null, $null)
+        $ar = $client.BeginConnect("127.0.0.1", $SocksPort, $null, $null)
         if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $client.Close(); return $false }
         $client.EndConnect($ar)
         $stream = $client.GetStream()
