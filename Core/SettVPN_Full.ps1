@@ -1046,6 +1046,22 @@ function Start-V2Ray {
             return $false
         }
 
+        # 1.5) TUN: confirma que o adaptador + rota foram criados (evita "conectado" falso com vazamento)
+        if ($Tun) {
+            $tunOk = $false
+            for ($i = 0; $i -lt 4; $i++) {
+                if (Test-V2RayTun) { $tunOk = $true; break }
+                Start-Sleep -Seconds 1
+            }
+            if (-not $tunOk) {
+                $tail = Get-XrayLogTail
+                $reason = if ($tail) { "Log: $tail" } else { "driver wintun ausente?" }
+                Write-Status "TUN falhou - trafego vazando. $reason" "ERROR"
+                Stop-V2Ray
+                return $false
+            }
+        }
+
         # 2) Estabilidade: multiplas checagens ativas espacadas (janela de $StabilitySeconds s)
         $checks = [Math]::Max(1, [int]($StabilitySeconds / 2))
         for ($i = 0; $i -lt $checks; $i++) {
@@ -1137,6 +1153,41 @@ function New-TlsClientHello {
     $arr[4] = [byte]($bodyLen -band 0xFF)
     $bw.Dispose(); $ms.Dispose()
     return $arr
+}
+
+function Test-V2RayTun {
+    # Verifica se o adaptador TUN foi criado e se a rota padrao passa por ele.
+    # Sem isso o app reportaria "conectado (TUN ON)" com trafego vazando direto.
+    try {
+        $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object {
+            $_.InterfaceDescription -match 'Wintun|WireGuard' -or $_.Name -match 'Wintun'
+        } | Select-Object -First 1
+        if (-not $adapter) { return $false }
+
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+            Where-Object { $_.ifIndex -eq $adapter.ifIndex }
+        return ($null -ne $route)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-XrayLogTail {
+    param([int]$Lines = 40)
+
+    if (-not $Script:XrayLog -or -not (Test-Path $Script:XrayLog)) { return "" }
+    try {
+        $tail = Get-Content $Script:XrayLog -Tail $Lines -ErrorAction Stop
+        $err = @($tail | Where-Object { $_ -match 'wintun|tun|error|fail|level=error|level=warning' })
+        if ($err.Count -gt 0) {
+            return (($err | Select-Object -Last 3) -join " | ")
+        }
+        return (($tail | Select-Object -Last 2) -join " | ")
+    }
+    catch {
+        return ""
+    }
 }
 
 function Test-V2RayTunnel {
