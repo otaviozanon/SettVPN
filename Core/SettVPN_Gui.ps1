@@ -19,6 +19,7 @@ $Script:GuiSync = [hashtable]::Synchronized(@{
     ScanTotal       = 0
     ScanTested      = 0
     ScanStart       = [DateTime]::MinValue
+    ScanDeadline    = [DateTime]::MinValue
     TunEnabled      = $false
     Filtered        = $false
 })
@@ -674,8 +675,8 @@ public class SettVPNNative {
     $Script:connectScript = @'
 if (-not $Sync.Servers -or $Sync.Servers.Count -eq 0) { $Sync.StatusText = "Atualize a lista primeiro"; return }
 foreach ($cfg in $Sync.Servers) {
-    $Sync.StatusText = "Conectando: $($cfg.Name)"
-    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)"; return }
+    $Sync.StatusText = "Conectando: $(Get-ShortName $cfg.Name)"
+    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $(Get-ShortName $cfg.Name)"; return }
 }
 $Sync.ConnectedConfig = $null
 $Sync.StatusText = "Falha ao conectar nos servidores listados"
@@ -688,8 +689,8 @@ $pool = @($Sync.Servers | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($Ba
 $pool = @($pool | Sort-Object -Property @{ Expression = { [int]$_.Ping } })
 if ($pool.Count -gt 0) {
     foreach ($cfg in $pool) {
-        $Sync.StatusText = "Tentando: $($cfg.Name) ($($cfg.Ping)ms)"
-        if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)"; return }
+        $Sync.StatusText = "Tentando: $(Get-ShortName $cfg.Name) ($($cfg.Ping)ms)"
+        if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $(Get-ShortName $cfg.Name)"; return }
     }
 }
 
@@ -711,8 +712,8 @@ else {
     $Sync.Servers = $candidates
 }
 foreach ($cfg in $candidates) {
-    $Sync.StatusText = "Tentando: $($cfg.Name) ($($cfg.Ping)ms)"
-    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)"; return }
+    $Sync.StatusText = "Tentando: $(Get-ShortName $cfg.Name) ($($cfg.Ping)ms)"
+    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $(Get-ShortName $cfg.Name)"; return }
 }
 $Sync.ConnectedConfig = $null
 $Sync.StatusText = "Falhou em todos os servidores"
@@ -749,9 +750,9 @@ if ($stable.Count -gt 0) { $Sync.StatusText = "Estaveis: $($stable.Count)" } els
 $idx = $Sync.SelectedIndex
 if ($idx -lt 0 -or $idx -ge $Sync.Servers.Count) { $Sync.StatusText = "Nenhum servidor selecionado"; return }
 $cfg = $Sync.Servers[$idx]
-$Sync.StatusText = "Conectando: $($cfg.Name)"
-if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $($cfg.Name)" }
-else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $($cfg.Name)" }
+$Sync.StatusText = "Conectando: $(Get-ShortName $cfg.Name)"
+if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $(Get-ShortName $cfg.Name)" }
+else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $(Get-ShortName $cfg.Name)" }
 '@
 
     $Script:tunToggleScript = @'
@@ -803,6 +804,7 @@ else {
         $Script:GuiSync.ScanTotal = 0
         $Script:GuiSync.ScanTested = 0
         $Script:GuiSync.ScanStart = [DateTime]::MinValue
+        $Script:GuiSync.ScanDeadline = [DateTime]::MinValue
         Add-GuiLog "Filtrando (teste de estabilidade)..." "INFO"
         Invoke-Background -OpScript $Script:filterScript -OnComplete {
             Populate-ServerList
@@ -925,12 +927,7 @@ else {
             if ($Script:GuiLblProgress) {
                 $total = [int]$Script:GuiSync.ScanTotal
                 if ($p -gt 0 -and $p -lt 100 -and $total -gt 0) {
-                    $elapsed = 0.0
-                    $ss = $Script:GuiSync.ScanStart
-                    if ($ss -and $ss -ne [DateTime]::MinValue) {
-                        $elapsed = ((Get-Date) - $ss).TotalSeconds
-                    }
-                    $remaining = Get-ScanRemainingSeconds -ElapsedSeconds $elapsed
+                    $remaining = Get-ScanRemainingSeconds -Deadline $Script:GuiSync.ScanDeadline
                     $txt = "$p%"
                     if ($remaining -ge 60) {
                         $txt += " - restante ~$([int]($remaining/60))m$($remaining % 60)s"

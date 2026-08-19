@@ -48,24 +48,24 @@ function Assert-True {
     }
 }
 
-Write-Host "`n== Bug 1: contagem regressiva (4 min, sempre decrescente) ==" -ForegroundColor Cyan
+Write-Host "`n== Bug 1: contagem regressiva (ETA adaptativo) ==" -ForegroundColor Cyan
 
-Assert-Equal (Get-ScanRemainingSeconds -ElapsedSeconds 0) 240 "Inicio = 4 min (240s)"
-Assert-Equal (Get-ScanRemainingSeconds -ElapsedSeconds 60) 180 "Apos 1 min -> 180s"
-Assert-Equal (Get-ScanRemainingSeconds -ElapsedSeconds 240) 0 "Apos 4 min -> 0"
-Assert-Equal (Get-ScanRemainingSeconds -ElapsedSeconds 300) 0 "Passou de 4 min -> mantem 0 (nao fica negativo)"
+Assert-Equal (Get-ScanEtaSeconds -ElapsedSeconds 150 -Total 25 -Tested 5) 600.0 "ETA 25 serv, 5 testados em 150s -> 20 * 30s = 600"
+Assert-Equal (Get-ScanEtaSeconds -ElapsedSeconds 100 -Total 10 -Tested 10) 0.0 "Todos testados -> ETA 0"
+Assert-Equal (Get-ScanEtaSeconds -ElapsedSeconds 0 -Total 10 -Tested 0) 0.0 "Nenhum testado -> ETA 0"
+Assert-Equal (Get-ScanEtaSeconds -ElapsedSeconds 30 -Total 25 -Tested 1) 720.0 "1 servidor em 30s -> 24 * 30s = 720"
 
-$prev = Get-ScanRemainingSeconds -ElapsedSeconds 0
-$deltas = @()
-for ($s = 0.5; $s -le 240; $s += 0.5) {
-    $cur = Get-ScanRemainingSeconds -ElapsedSeconds $s
-    $deltas += ($prev - $cur)
-    $prev = $cur
-}
-$maxDelta = ($deltas | Measure-Object -Maximum).Maximum
-$minDelta = ($deltas | Measure-Object -Minimum).Minimum
-Assert-True ($maxDelta -le 1) "Cai de no max 1s por tick (max delta = $maxDelta)"
-Assert-True ($minDelta -ge 0) "Nunca sobe (min delta = $minDelta)"
+$deadline = [DateTime]::Now.AddSeconds(100)
+$r0 = Get-ScanRemainingSeconds -Deadline $deadline
+Assert-True ($r0 -ge 99 -and $r0 -le 100) "Deadline +100s -> restante ~100 (obtido $r0)"
+Assert-Equal (Get-ScanRemainingSeconds -Deadline ([DateTime]::Now.AddSeconds(-5))) 0 "Deadline no passado -> 0"
+Assert-Equal (Get-ScanRemainingSeconds -Deadline ([DateTime]::MinValue)) 0 "Sem deadline -> 0"
+
+$d1 = Get-ScanRemainingSeconds -Deadline $deadline
+Start-Sleep -Milliseconds 1100
+$d2 = Get-ScanRemainingSeconds -Deadline $deadline
+Assert-True ($d2 -le $d1) "Restante desce com o tempo ($d1 -> $d2)"
+Assert-True (($d1 - $d2) -ge 0 -and ($d1 - $d2) -le 2) "Cai ~1s por segundo (delta = $($d1 - $d2))"
 
 Write-Host "`n== Bug 4: mapeamento de pais ==" -ForegroundColor Cyan
 

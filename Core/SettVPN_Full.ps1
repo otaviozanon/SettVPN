@@ -299,6 +299,15 @@ function ConvertTo-Config {
     return $parsed
 }
 
+function Get-ShortName {
+    param([string]$Name, [int]$Max = 26)
+
+    # Encurta nomes de servidor (listas livres usam nomes muito longos) pra log nao cortar.
+    if (-not $Name) { return "" }
+    if ($Name.Length -le $Max) { return $Name }
+    return $Name.Substring(0, [Math]::Max(1, $Max - 3)).TrimEnd() + "..."
+}
+
 function Download-SubSource {
     param([string]$Url, [string]$Cache, [string]$Label)
 
@@ -376,6 +385,20 @@ function Get-AllConfigs {
         }
         Write-Status "$($src.Label): $count found" "INFO"
     }
+
+    # Dedup: remove espelhos (mesmo protocolo+host+porta vindos de agregadores diferentes)
+    $seen = @{}
+    $unique = @()
+    foreach ($cfg in $configs) {
+        $key = "$($cfg.Protocol)|$($cfg.Host)|$($cfg.Port)"
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $unique += $cfg
+        }
+    }
+    $dupes = $configs.Count - $unique.Count
+    if ($dupes -gt 0) { Write-Status "Removidos $dupes duplicados (espelhos)" "INFO" }
+    $configs = $unique
 
     if ($configs.Count -gt 400) {
         $configs = @($configs[0..399])
@@ -749,43 +772,67 @@ function Test-ConfigStable {
 }
 
 function Scan-StableServers {
-    param([array]$Configs, [int]$MaxToTest = 25, [int]$StabilitySeconds = 10)
+    param([array]$Configs, [int]$MaxToTest = 25, [int]$StabilitySeconds = 6, [int]$MinStable = 10)
 
     $stable = @()
     $tested = 0
     $total = [Math]::Min($Configs.Count, $MaxToTest)
     if ($total -le 0) { return $stable }
-    if ($Sync) { $Sync.ScanTotal = $total; $Sync.ScanTested = 0; $Sync.ScanStart = [DateTime]::Now }
+    $scanSw = [System.Diagnostics.Stopwatch]::StartNew()
+    if ($Sync) {
+        $Sync.ScanTotal = $total; $Sync.ScanTested = 0; $Sync.ScanStart = [DateTime]::Now
+        $Sync.ScanDeadline = [DateTime]::Now.AddSeconds($total * 30)
+    }
     foreach ($cfg in $Configs) {
         if ($tested -ge $MaxToTest) { break }
         $tested++
         if ($Sync) { $Sync.ScanTested = $tested; $Sync.Progress = [int](($tested / $total) * 100) }
-        Write-Status "Testando estabilidade ($tested/$total): $($cfg.Name)" "INFO"
+        Write-Status "Testando estabilidade ($tested/$total): $(Get-ShortName $cfg.Name)" "INFO"
         if (Start-V2Ray -Config $cfg -StabilitySeconds $StabilitySeconds) {
             # Exige UDP alem de TCP (Discord/voz, jogos, DNS usam UDP)
             $udpOk = Test-V2RayUdp
             Stop-V2Ray
             if ($udpOk) {
                 $stable += $cfg
-                Write-Status "Estavel (TCP+UDP): $($cfg.Name)" "OK"
+                Write-Status "Estavel (TCP+UDP): $(Get-ShortName $cfg.Name)" "OK"
+                if ($MinStable -gt 0 -and $stable.Count -ge $MinStable) {
+                    Write-Status "Encerrando scan: $($stable.Count) servidores estaveis" "OK"
+                    break
+                }
             }
             else {
-                Write-Status "Sem UDP (descartado): $($cfg.Name)" "WARN"
+                Write-Status "Sem UDP (descartado): $(Get-ShortName $cfg.Name)" "WARN"
             }
         }
         else {
-            Write-Status "Descartado: $($cfg.Name)" "WARN"
+            Write-Status "Descartado: $(Get-ShortName $cfg.Name)" "WARN"
+        }
+        # ETA adaptativo: media real de tempo por servidor x servidores restantes
+        if ($Sync) {
+            $eta = Get-ScanEtaSeconds -ElapsedSeconds $scanSw.Elapsed.TotalSeconds -Total $total -Tested $tested
+            $Sync.ScanDeadline = [DateTime]::Now.AddSeconds($eta)
         }
     }
-    if ($Sync) { $Sync.Progress = 100 }
+    if ($Sync) { $Sync.Progress = 100; $Sync.ScanDeadline = [DateTime]::Now }
     return $stable
 }
 
-function Get-ScanRemainingSeconds {
-    param([double]$ElapsedSeconds)
+function Get-ScanEtaSeconds {
+    param([double]$ElapsedSeconds, [int]$Total, [int]$Tested)
 
-    # Contagem regressiva fixa de 4 min (sempre decrescente, sem pular pra cima)
-    return [int][Math]::Max(0, 240 - $ElapsedSeconds)
+    # Tempo medio real por servidor (dos ja testados) x servidores restantes.
+    if ($Total -le 0 -or $Tested -le 0) { return 0.0 }
+    $avg = $ElapsedSeconds / $Tested
+    $left = [Math]::Max(0, $Total - $Tested)
+    return [double]($left * $avg)
+}
+
+function Get-ScanRemainingSeconds {
+    param([datetime]$Deadline = [DateTime]::MinValue)
+
+    # Contagem regressiva a partir do deadline estimado (cai 1s por segundo).
+    if ($Deadline -eq [DateTime]::MinValue) { return 0 }
+    return [int][Math]::Max(0, [Math]::Ceiling(($Deadline - [DateTime]::Now).TotalSeconds))
 }
 
 # ============================================================
@@ -990,7 +1037,7 @@ function Start-V2Ray {
             Start-Sleep -Milliseconds 500
         }
         if (-not $ready) {
-            Write-Status "Tunnel check failed: $($Config.Name)" "WARN"
+            Write-Status "Tunnel check failed: $(Get-ShortName $Config.Name)" "WARN"
             Stop-V2Ray
             return $false
         }
@@ -998,21 +1045,21 @@ function Start-V2Ray {
         # 2) Estabilidade: multiplas checagens ativas espacadas (janela de $StabilitySeconds s)
         $checks = [Math]::Max(1, [int]($StabilitySeconds / 2))
         for ($i = 0; $i -lt $checks; $i++) {
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 1
             if (-not ($Script:V2RayProcess -and -not $Script:V2RayProcess.HasExited)) {
-                Write-Status "v2ray process exited: $($Config.Name)" "ERROR"
+                Write-Status "v2ray process exited: $(Get-ShortName $Config.Name)" "ERROR"
                 Stop-V2Ray
                 return $false
             }
             if (-not (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500)) {
-                Write-Status "Server instavel (caiu): $($Config.Name)" "WARN"
+                Write-Status "Server instavel (caiu): $(Get-ShortName $Config.Name)" "WARN"
                 Stop-V2Ray
                 return $false
             }
         }
 
         if ($Script:V2RayProcess -and -not $Script:V2RayProcess.HasExited) {
-            Write-Status "Connected to VPN: $($Config.Name)" "OK"
+            Write-Status "Connected to VPN: $(Get-ShortName $Config.Name)" "OK"
             Write-Status "Protocol: $($Config.Protocol) | Server: $($Config.Host):$($Config.Port) | Ping: $($Config.Ping)ms" "INFO"
             Write-Host ""
             Write-Host "  =============================================" -ForegroundColor Cyan
