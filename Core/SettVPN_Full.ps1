@@ -22,6 +22,8 @@ $Script:SubCache = Join-Path $Script:TempDir "pawdroid-sub.txt"
 $Script:Sub2Cache = Join-Path $Script:TempDir "peasoft-sub.txt"
 $Script:V2RayProcess = $null
 $Script:CurrentConfig = $null
+$Script:LastFailReason = ""
+$Script:TunStopFile = $null
 $Script:AbcConfigsUrl = "https://raw.githubusercontent.com/FreeFolksOn/abc-configs-free-vpn-proxy-list/main/README.md"
 $Script:SubConfigsUrl = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
 $Script:Sub2ConfigsUrl = "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt"
@@ -61,6 +63,7 @@ function Initialize-Environment {
         New-Item -ItemType Directory -Path $Script:TempDir -Force | Out-Null
         Write-Status "Created temp directory: $Script:TempDir" "OK"
     }
+    Restore-OrphanProxy
 }
 
 function Extract-V2Ray {
@@ -203,6 +206,12 @@ function Parse-VmessConfig {
             $base64 = $matches[1]
             $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
             $json = $decoded | ConvertFrom-Json
+
+            $guid = [guid]::Empty
+            if (-not [guid]::TryParse([string]$json.id, [ref]$guid)) {
+                Write-Status "Skipping VMess config with non-UUID id: $($json.id)" "WARN"
+                return $null
+            }
 
             return @{
                 Protocol = "vmess"
@@ -847,6 +856,13 @@ function Scan-StableServers {
         $Sync.ScanDeadline = [DateTime]::Now.AddSeconds($total * 30)
     }
 
+    # Limpa arquivos temporarios do scan anterior (evita acumular no %TEMP%)
+    try {
+        Get-ChildItem $Script:TempDir -Filter "config-scan-*.json" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        Get-ChildItem $Script:TempDir -Filter "xray-scan-*.log" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    catch { }
+
     $funcSource = Get-FuncSource
     $offset = 0
     while ($offset -lt $total -and ($MinStable -le 0 -or $stable.Count -lt $MinStable)) {
@@ -1138,34 +1154,63 @@ function Resolve-Countries {
     }
 }
 
+function Test-IsAdmin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 function Start-V2Ray {
     param([hashtable]$Config, [int]$StabilitySeconds = 3, [bool]$Tun = $false)
+
+    $Script:LastFailReason = ""
 
     # Stop existing process
     Stop-V2Ray
 
     # TUN no Windows exige o driver wintun.dll ao lado do v2ray.exe
     if ($Tun -and (-not $Script:WintunDll -or -not (Test-Path $Script:WintunDll))) {
-        Write-Status "wintun.dll ausente - modo TUN indisponivel" "ERROR"
+        $Script:LastFailReason = "wintun.dll ausente - modo TUN indisponivel"
+        Write-Status $Script:LastFailReason "ERROR"
         return $false
     }
 
     # Generate config
     if (-not (Generate-V2RayConfig -Config $Config -Tun $Tun)) {
+        $Script:LastFailReason = "Falha ao gerar config do xray"
         return $false
     }
 
     # Start v2ray
     try {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $Script:V2RayExe
-        $psi.Arguments = "run -c `"$Script:ConfigJson`""
-        $psi.UseShellExecute = $false
-        $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
-
-        $Script:V2RayProcess = [System.Diagnostics.Process]::Start($psi)
+        $Script:TunStopFile = $null
+        if ($Tun -and -not (Test-IsAdmin)) {
+            # TUN exige admin (adaptador wintun). Sobe um supervisor elevado que
+            # gerencia o xray; o resto do app segue sem privilegios.
+            $supervisorScript = @'
+param($xray, $config, $stopFile)
+$p = Start-Process -FilePath $xray -ArgumentList "run -c `"$config`"" -PassThru -NoNewWindow
+while (-not (Test-Path $stopFile) -and -not $p.HasExited) { Start-Sleep -Milliseconds 300 }
+if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+'@
+            $stopFile = Join-Path $Script:TempDir "tun-stop.txt"
+            Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
+            $supervisorPath = Join-Path $Script:TempDir "tun-supervisor.ps1"
+            Set-Content -Path $supervisorPath -Value $supervisorScript -Encoding UTF8
+            $supervisor = Start-Process powershell -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$supervisorPath`" -xray `"$($Script:V2RayExe)`" -config `"$($Script:ConfigJson)`" -stopFile `"$stopFile`""
+            $Script:V2RayProcess = $supervisor
+            $Script:TunStopFile = $stopFile
+        }
+        else {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $Script:V2RayExe
+            $psi.Arguments = "run -c `"$Script:ConfigJson`""
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $Script:V2RayProcess = [System.Diagnostics.Process]::Start($psi)
+        }
         $Script:CurrentConfig = $Config
 
         # 1) Prontidao: espera o tunel responder (poll ate ~6s, sem sleep cego)
@@ -1182,7 +1227,8 @@ function Start-V2Ray {
             Start-Sleep -Milliseconds 500
         }
         if (-not $ready) {
-            Write-Status "Tunnel check failed: $(Get-ShortName $Config.Name)" "WARN"
+            $Script:LastFailReason = "Tunnel check failed: $(Get-ShortName $Config.Name)$(Get-FailReason)"
+            Write-Status $Script:LastFailReason "WARN"
             Stop-V2Ray
             return $false
         }
@@ -1197,7 +1243,8 @@ function Start-V2Ray {
             if (-not $tunOk) {
                 $tail = Get-XrayLogTail
                 $reason = if ($tail) { "Log: $tail" } else { "driver wintun ausente?" }
-                Write-Status "TUN falhou - trafego vazando. $reason" "ERROR"
+                $Script:LastFailReason = "TUN falhou - trafego vazando. $reason"
+                Write-Status $Script:LastFailReason "ERROR"
                 Stop-V2Ray
                 return $false
             }
@@ -1208,12 +1255,14 @@ function Start-V2Ray {
         for ($i = 0; $i -lt $checks; $i++) {
             Start-Sleep -Seconds 1
             if (-not ($Script:V2RayProcess -and -not $Script:V2RayProcess.HasExited)) {
-                Write-Status "v2ray process exited: $(Get-ShortName $Config.Name)" "ERROR"
+                $Script:LastFailReason = "v2ray process exited: $(Get-ShortName $Config.Name)$(Get-FailReason)"
+                Write-Status $Script:LastFailReason "ERROR"
                 Stop-V2Ray
                 return $false
             }
             if (-not (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500)) {
-                Write-Status "Server instavel (caiu): $(Get-ShortName $Config.Name)" "WARN"
+                $Script:LastFailReason = "Server instavel (caiu): $(Get-ShortName $Config.Name)$(Get-FailReason)"
+                Write-Status $Script:LastFailReason "WARN"
                 Stop-V2Ray
                 return $false
             }
@@ -1243,7 +1292,8 @@ function Start-V2Ray {
         }
     }
     catch {
-        Write-Status "Failed to start v2ray: $_" "ERROR"
+        $Script:LastFailReason = "Failed to start v2ray: $_"
+        Write-Status $Script:LastFailReason "ERROR"
         return $false
     }
 }
@@ -1254,8 +1304,15 @@ function Stop-V2Ray {
         $ownPid = $Script:V2RayProcess.Id
         try {
             if (-not $Script:V2RayProcess.HasExited) {
-                $Script:V2RayProcess.Kill()
-                [void]$Script:V2RayProcess.WaitForExit(5000)
+                if ($Script:TunStopFile) {
+                    # xray elevado via supervisor: sinaliza para o supervisor encerrar o xray e sair
+                    try { New-Item -Path $Script:TunStopFile -ItemType File -Force | Out-Null } catch { }
+                    [void]$Script:V2RayProcess.WaitForExit(5000)
+                }
+                else {
+                    $Script:V2RayProcess.Kill()
+                    [void]$Script:V2RayProcess.WaitForExit(5000)
+                }
             }
             $Script:V2RayProcess.Dispose()
             Write-Status "VPN disconnected" "OK"
@@ -1266,6 +1323,11 @@ function Stop-V2Ray {
 
         $Script:V2RayProcess = $null
         $Script:CurrentConfig = $null
+    }
+
+    if ($Script:TunStopFile) {
+        try { Remove-Item $Script:TunStopFile -Force -ErrorAction SilentlyContinue } catch { }
+        $Script:TunStopFile = $null
     }
 
     # Mata apenas o NOSSO binario (PID rastreado ou caminho exato), nunca v2ray de terceiros.
@@ -1327,15 +1389,36 @@ function Get-XrayLogTail {
     if (-not $Script:XrayLog -or -not (Test-Path $Script:XrayLog)) { return "" }
     try {
         $tail = Get-Content $Script:XrayLog -Tail $Lines -ErrorAction Stop
-        $err = @($tail | Where-Object { $_ -match 'wintun|tun|error|fail|level=error|level=warning' })
-        if ($err.Count -gt 0) {
-            return (($err | Select-Object -Last 3) -join " | ")
+        $reasons = @()
+        foreach ($line in $tail) {
+            $ms = [regex]::Matches($line, '\b\d{3}\s+(?:Conflict|Not Found|Bad Request|Bad Gateway|Moved Permanently|Moved Temporarily|Forbidden|Unauthorized|Service Unavailable|Internal Server Error|Gateway Timeout|Too Many Requests)|bad handshake|unexpected EOF|connection refused|i/o timeout|forcibly closed|wintun|tun2socks')
+            foreach ($m in $ms) {
+                $r = $m.Value.Trim()
+                if ($r -and ($reasons -notcontains $r)) { $reasons += $r }
+            }
         }
-        return (($tail | Select-Object -Last 2) -join " | ")
+        if ($reasons.Count -gt 0) {
+            $msg = ($reasons -join " | ")
+            if ($msg.Length -gt 160) { $msg = $msg.Substring(0, 160) + "..." }
+            return $msg
+        }
+        $generic = @($tail | Where-Object { $_ -match '\[(Error|Warning)\]' } | Select-Object -Last 1)
+        if ($generic.Count -gt 0) {
+            $msg = ($generic[0] -replace '^.*?\]\s*', '')
+            if ($msg.Length -gt 120) { $msg = $msg.Substring(0, 120) + "..." }
+            return $msg
+        }
+        return ""
     }
     catch {
         return ""
     }
+}
+
+function Get-FailReason {
+    $tail = Get-XrayLogTail
+    if ($tail) { return " | $tail" }
+    return ""
 }
 
 function Test-V2RayTunnel {
@@ -1520,6 +1603,7 @@ function Test-V2RayUdp {
 $Script:ProxyActive = $false
 $Script:ProxyBackupEnable = $null
 $Script:ProxyBackupServer = $null
+$Script:ProxyBackupFile = Join-Path $Script:TempDir "proxy-backup.json"
 
 if (-not ("SettVPN.WinInetNative" -as [type])) {
     Add-Type -TypeDefinition @"
@@ -1547,11 +1631,40 @@ function Set-ProxyRegistry {
     catch { }
 }
 
+function Save-ProxyBackup {
+    param([int]$Enable, [string]$Server)
+    try {
+        $obj = @{ Enable = $Enable; Server = [string]$Server }
+        [System.IO.File]::WriteAllText($Script:ProxyBackupFile, ($obj | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+    }
+    catch { }
+}
+
+function Clear-ProxyBackup {
+    try { if (Test-Path $Script:ProxyBackupFile) { Remove-Item $Script:ProxyBackupFile -Force -ErrorAction Stop } } catch { }
+}
+
+function Restore-OrphanProxy {
+    # Se o app caiu numa execucao anterior com o proxy ligado, o backup em disco
+    # continua e o registro aponta p/ 127.0.0.1 morto -> restaura e limpa.
+    if (-not (Test-Path $Script:ProxyBackupFile)) { return }
+    try {
+        $obj = Get-Content $Script:ProxyBackupFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($obj) {
+            Set-ProxyRegistry -Enable ([int]$obj.Enable) -Server ([string]$obj.Server)
+            Write-Status "Proxy do sistema restaurado (execucao anterior caiu com proxy ativo)" "WARN"
+        }
+    }
+    catch { }
+    Clear-ProxyBackup
+}
+
 function Enable-SystemProxy {
     if (-not $Script:ProxyActive) {
         $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
         $Script:ProxyBackupEnable = (Get-ItemProperty -Path $path -Name ProxyEnable -ErrorAction SilentlyContinue).ProxyEnable
         $Script:ProxyBackupServer = (Get-ItemProperty -Path $path -Name ProxyServer -ErrorAction SilentlyContinue).ProxyServer
+        Save-ProxyBackup -Enable ([int]$Script:ProxyBackupEnable) -Server ([string]$Script:ProxyBackupServer)
     }
     Set-ProxyRegistry -Enable 1 -Server "http=127.0.0.1:10809;https=127.0.0.1:10809;socks=127.0.0.1:10808"
     $Script:ProxyActive = $true
@@ -1565,6 +1678,7 @@ function Disable-SystemProxy {
     else {
         Set-ProxyRegistry -Enable 0
     }
+    Clear-ProxyBackup
     $Script:ProxyActive = $false
     Write-Status "System proxy disabled" "OK"
 }
@@ -1640,11 +1754,13 @@ function Menu-ConnectVPN {
             return
         }
         else {
-            Write-Status "Failed, trying next server..." "WARN"
+            if ($Script:LastFailReason) { Write-Status "Falhou: $Script:LastFailReason" "WARN" }
+            else { Write-Status "Failed, trying next server..." "WARN" }
         }
     }
 
-    Write-Status "All servers failed to connect" "ERROR"
+    if ($Script:LastFailReason) { Write-Status "Todos falharam - ultima causa: $Script:LastFailReason" "ERROR" }
+    else { Write-Status "All servers failed to connect" "ERROR" }
     Read-Host "Press Enter to continue"
 }
 
@@ -1701,7 +1817,8 @@ function Menu-ChangeVPN {
             Write-Status "Successfully connected!" "OK"
         }
         else {
-            Write-Status "Connection failed" "ERROR"
+            if ($Script:LastFailReason) { Write-Status "Falhou: $Script:LastFailReason" "ERROR" }
+            else { Write-Status "Connection failed" "ERROR" }
         }
     }
     else {

@@ -23,15 +23,17 @@
 - **🖥️ Dark UI** — minimalist WPF interface with custom title bar and lightning icon
 - **🛡️ System proxy toggle** — HTTP + SOCKS5 system-wide in one click
 - **🌐 TUN mode** — routes the *entire* system through the VPN (Discord voice/WebRTC included)
+- **🧰 Crash-safe** — restores the system proxy if the app closes unexpectedly; single-instance
 
 ---
 
 ## 🚀 Quick Start
 
 1. Download `SettVPN.exe`
-2. Double-click it and accept the **UAC prompt** (runs as administrator, required for TUN)
+2. Double-click it — it runs as a **normal user** (no admin at launch)
 3. Click **ATUALIZAR** (fast list of reachable servers) then **FILTRAR** (keeps only stable TCP+UDP servers)
 4. Click **CONECTAR (MENOR PING)**
+5. To route the whole system (Discord voice, games), enable **TUN** — Windows asks for **admin** at that moment only
 
 > ⚠️ **First run:** Windows may show _"Unknown publisher"_ (unsigned binary). Click **More info → Run anyway** and **Yes**.
 

@@ -96,6 +96,14 @@ $ss = Parse-ShadowsocksConfig -Uri ('ss://' + $ssB64 + '@2.3.4.5:8388#SS-Node')
 Assert-Equal $ss.Protocol 'shadowsocks' 'Parse ss protocolo'
 Assert-Equal $ss.Method 'aes-256-gcm' 'Parse ss metodo'
 
+$vmessOk = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('{"v":"2","ps":"good","add":"1.2.3.4","port":"443","id":"123e4567-e89b-12d3-a456-426614174000","aid":"0","net":"tcp","type":"none","scy":"auto"}'))
+$vm = Parse-VmessConfig -Uri ('vmess://' + $vmessOk)
+Assert-Equal $vm.Protocol 'vmess' 'Parse vmess protocolo'
+Assert-Equal $vm.UUID '123e4567-e89b-12d3-a456-426614174000' 'Parse vmess uuid'
+
+$vmessBad = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('{"v":"2","ps":"bad","add":"1.2.3.4","port":"443","id":"not-a-uuid","aid":"0","net":"tcp","type":"none","scy":"auto"}'))
+Assert-Equal (Parse-VmessConfig -Uri ('vmess://' + $vmessBad)) $null 'Parse vmess com UUID invalido -> null'
+
 Write-Host "`n== Filtro de estabilidade (Test-ConfigStable) ==" -ForegroundColor Cyan
 
 Assert-True (-not (Test-ConfigStable -Config @{ Params = 'type=grpc'; Host = 'x.com' })) 'Rejeita transport grpc'
@@ -230,6 +238,28 @@ $httpIn = @($jsonScan.inbounds | Where-Object { $_.protocol -eq 'http' })[0]
 Assert-Equal $socksIn.port 10818 'Config scan: socks na porta custom'
 Assert-Equal $httpIn.port 10819 'Config scan: http na porta custom'
 Assert-True (Test-Path $scanCfgPath) 'Config scan: arquivo gravado no caminho custom'
+
+Write-Host "`n== Get-XrayLogTail (resumo de erro, sem falso-positivo) ==" -ForegroundColor Cyan
+
+$fakeLog = @(
+    '2026/08/19 10:26:00.1 [Info] [1] proxy/socks: TCP Connect request to tcp:example.com:443',
+    '2026/08/19 10:26:00.2 [Info] [1] proxy/vless/outbound: tunneling request to tcp:example.com:443 via 104.16.174.46:443',
+    '2026/08/19 10:26:01.3 [Info] [1] transport/internet: failed to dial to (ws://104.16.104.151/): 409 Conflict > websocket: bad handshake',
+    '2026/08/19 10:26:02.4 [Info] [1] proxy/trojan: connection ends > websocket: close 1006 (abnormal closure): unexpected EOF',
+    '2026/08/19 10:26:03.5 [Info] [1] app/proxyman: failed to process outbound traffic > read tcp: forcibly closed'
+)
+Set-Content -Path $Script:XrayLog -Value $fakeLog -Encoding UTF8
+$tail = Get-XrayLogTail -Lines 40
+Assert-True ($tail -match '409 Conflict') 'LogTail captura 409 Conflict'
+Assert-True ($tail -match 'bad handshake') 'LogTail captura bad handshake'
+Assert-True ($tail -match 'unexpected EOF') 'LogTail captura unexpected EOF'
+Assert-True ($tail -match 'forcibly closed') 'LogTail captura forcibly closed'
+Assert-True (-not ($tail -match '443 via')) 'LogTail NAO produz falso-positivo (443 via)'
+Assert-True (-not ($tail -match 'tunneling request')) 'LogTail NAO inclui linha de log crua'
+Assert-True ($tail -notmatch "`n") 'LogTail retorna uma linha unica (sem quebra de linha)'
+
+Set-Content -Path $Script:XrayLog -Value '2026/08/19 10:27:00.0 [Error] failed to create TUN interface: code 5'
+Assert-True ((Get-XrayLogTail -Lines 40) -match 'TUN interface') 'LogTail fallback captura erro generico (TUN)'
 
 Write-Host ''
 Write-Host "Resultado: $($script:Pass) passaram, $($script:Fail) falharam"

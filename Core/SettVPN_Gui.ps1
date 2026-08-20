@@ -74,6 +74,8 @@ Set-StrictMode -Version Latest
 `$Script:V2RayProcess = `$null
 `$Script:CurrentConfig = `$null
 `$Script:ProxyActive = `$false
+`$Script:LastFailReason = `$null
+`$Script:TunStopFile = `$null
 `$Sync = `$GuiSyncRef
 `$BadServers = `$BadServersRef
 `$ErrorActionPreference = 'Continue'
@@ -682,7 +684,7 @@ foreach ($cfg in $Sync.Servers) {
     if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $(Get-ShortName $cfg.Name)"; return }
 }
 $Sync.ConnectedConfig = $null
-$Sync.StatusText = "Falha ao conectar nos servidores listados"
+$Sync.StatusText = if ($Script:LastFailReason) { "Falhou em todos: $Script:LastFailReason" } else { "Falha ao conectar nos servidores listados" }
 '@
 
     $Script:reconnectScript = @'
@@ -707,7 +709,7 @@ foreach ($cfg in $candidates) {
     if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $(Get-ShortName $cfg.Name)"; return }
 }
 $Sync.ConnectedConfig = $null
-$Sync.StatusText = "Falhou em todos os servidores"
+$Sync.StatusText = if ($Script:LastFailReason) { "Falhou em todos: $Script:LastFailReason" } else { "Falhou em todos os servidores" }
 '@
 
     $Script:refreshScript = @'
@@ -732,7 +734,7 @@ if ($idx -lt 0 -or $idx -ge $Sync.Servers.Count) { $Sync.StatusText = "Nenhum se
 $cfg = $Sync.Servers[$idx]
 $Sync.StatusText = "Conectando: $(Get-ShortName $cfg.Name)"
 if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.StatusText = "Conectado: $(Get-ShortName $cfg.Name)" }
-else { $Sync.ConnectedConfig = $null; $Sync.StatusText = "Falha ao conectar em $(Get-ShortName $cfg.Name)" }
+else { $Sync.ConnectedConfig = $null; $Sync.StatusText = if ($Script:LastFailReason) { $Script:LastFailReason } else { "Falha ao conectar em $(Get-ShortName $cfg.Name)" } }
 '@
 
     $Script:tunToggleScript = @'
@@ -748,7 +750,7 @@ if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) {
 }
 else {
     $Sync.ConnectedConfig = $null
-    $Sync.StatusText = "Falha ao reconectar com modo TUN"
+    $Sync.StatusText = if ($Script:LastFailReason) { "Falha ao reconectar: $Script:LastFailReason" } else { "Falha ao reconectar com modo TUN" }
 }
 '@
 

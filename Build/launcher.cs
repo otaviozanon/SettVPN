@@ -9,6 +9,7 @@ class SettVPNLauncher
 {
     static string TempDir = Path.Combine(Path.GetTempPath(), "SettVPN");
     static string AppDir = Path.Combine(TempDir, "app");
+    static Mutex InstanceMutex;
 
     static string[] ScriptResources = new[]
     {
@@ -66,6 +67,13 @@ class SettVPNLauncher
     [STAThread]
     static void Main()
     {
+        bool createdNew;
+        InstanceMutex = new Mutex(true, "SettVPN_SingleInstance_Mutex", out createdNew);
+        if (!createdNew)
+        {
+            return;
+        }
+
         try
         {
             Directory.CreateDirectory(AppDir);
