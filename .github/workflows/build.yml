@@ -1,4 +1,4 @@
-name: Build
+name: Build and release
 
 on:
   push:
@@ -9,15 +9,45 @@ on:
 permissions:
   contents: write
 
+# Nunca roda duas publicacoes ao mesmo tempo: duas releases concorrentes escolheriam
+# a mesma proxima versao.
+concurrency:
+  group: settvpn-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          }
+          else {
+            $last = (git describe --tags --abbrev=0 --match 'v*') 2>$null
+            if (-not $last) { $version = '1.0.0' }
+            else {
+              $p = ($last -replace '^v', '').Split('.')
+              $version = '{0}.{1}.{2}' -f [int]$p[0], [int]$p[1], ([int]$p[2] + 1)
+            }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $version"
 
       - name: Build self-contained exe
         shell: pwsh
+        env:
+          SETTVPN_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           .\build.ps1
           if (-not (Test-Path SettVPN.exe)) { throw "Build failed: SettVPN.exe not found" }
@@ -40,13 +70,25 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SettVPN
+          name: SettVPN-${{ steps.ver.outputs.version }}
           path: |
             SettVPN.exe
             SettVPN.zip
 
-      - name: Create release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" SettVPN.exe SettVPN.zip --title "SETT VPN ${{ github.ref_name }}"
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          gh release view $tag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists - nothing to publish"
+            exit 0
+          }
+          $args = @('release', 'create', $tag, 'SettVPN.exe', 'SettVPN.zip',
+                    '--title', "SETT VPN $tag", '--generate-notes')
+          # Tag push: a tag ja existe. Push no master: aponta a tag nova para este commit.
+          if (-not (git rev-parse -q --verify "refs/tags/$tag")) { $args += @('--target', $env:GITHUB_SHA) }
+          gh @args
+          if ($LASTEXITCODE -ne 0) { throw "Failed to publish release $tag" }

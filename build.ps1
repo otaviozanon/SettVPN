@@ -160,15 +160,39 @@ Write-Host "OK: $winIco (window icon)" -ForegroundColor Green
 # ---- Xray-core (fork do v2ray com suporte a TUN no Windows; baixado no build, nao commitado) ----
 $xrayVersion = "26.3.27"
 $xrayZipUrl  = "https://github.com/XTLS/Xray-core/releases/download/v$xrayVersion/Xray-windows-64.zip"
+# Hashes do release v26.3.27 (fonte: Xray-windows-64.zip.dgst). Atualize junto com $xrayVersion.
+$xrayZipSha256    = "d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad"
+$xrayExeSha256    = "15c2d007954ac53ba69b80ec91242786b3c0b71d52649165b4ca1d5cc96ef8f1"
+$xrayWintunSha256 = "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
 $xrayCache   = Join-Path $env:TEMP "SettVPN-build-xray"
 $v2rayExe    = Join-Path $xrayCache "v2ray.exe"      # xray.exe renomeado (mantem compatibilidade com o codigo)
 $wintunDll   = Join-Path $xrayCache "wintun.dll"
 
-if (-not (Test-Path $v2rayExe) -or -not (Test-Path $wintunDll)) {
+function Get-Sha256Text {
+    param([string]$Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+}
+
+$cacheOk = $false
+if ((Test-Path $v2rayExe) -and (Test-Path $wintunDll)) {
+    $cacheOk = ((Get-Sha256Text $v2rayExe) -eq $xrayExeSha256) -and ((Get-Sha256Text $wintunDll) -eq $xrayWintunSha256)
+    if (-not $cacheOk) { Write-Host "Cache do Xray divergiu do hash esperado - baixando de novo" -ForegroundColor Yellow }
+}
+
+if (-not $cacheOk) {
     Write-Host "Baixando Xray-core v$xrayVersion..." -ForegroundColor Cyan
+    if (Test-Path $xrayCache) { Remove-Item $xrayCache -Recurse -Force }
     New-Item -ItemType Directory -Path $xrayCache -Force | Out-Null
     $zipPath = Join-Path $xrayCache "xray.zip"
     Invoke-WebRequest -Uri $xrayZipUrl -OutFile $zipPath -UseBasicParsing
+
+    $zipHash = Get-Sha256Text $zipPath
+    if ($zipHash -ne $xrayZipSha256) {
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Write-Host "FALHA: SHA256 do zip nao confere (esperado $xrayZipSha256, veio $zipHash)" -ForegroundColor Red
+        exit 1
+    }
+
     Expand-Archive -Path $zipPath -DestinationPath $xrayCache -Force
     Remove-Item $zipPath -Force
 
@@ -192,9 +216,105 @@ if (-not (Test-Path $v2rayExe) -or -not (Test-Path $wintunDll)) {
 }
 if (-not (Test-Path $v2rayExe)) { Write-Host "FALHA ao obter xray.exe" -ForegroundColor Red; exit 1 }
 if (-not (Test-Path $wintunDll)) { Write-Host "FALHA ao obter wintun.dll" -ForegroundColor Red; exit 1 }
-Write-Host "OK: Xray v$xrayVersion ($([math]::Round((Get-Item $v2rayExe).Length/1MB,1)) MB) + wintun.dll" -ForegroundColor Green
+if ((Get-Sha256Text $v2rayExe) -ne $xrayExeSha256) { Write-Host "FALHA: SHA256 de v2ray.exe nao confere" -ForegroundColor Red; exit 1 }
+if ((Get-Sha256Text $wintunDll) -ne $xrayWintunSha256) { Write-Host "FALHA: SHA256 de wintun.dll nao confere" -ForegroundColor Red; exit 1 }
+Write-Host "OK: Xray v$xrayVersion ($([math]::Round((Get-Item $v2rayExe).Length/1MB,1)) MB) + wintun.dll (SHA256 verificado)" -ForegroundColor Green
+
+# ---- GeoIP offline (DB-IP Lite country, CC BY 4.0) ----
+# Formato embarcado: 10 bytes por registro IPv4 ordenado por inicio:
+# start (uint32 LE) + end (uint32 LE) + codigo do pais (2 chars ASCII).
+$dbIpVersion = "2026-11"
+$dbIpUrl     = "https://download.db-ip.com/free/dbip-country-lite-$dbIpVersion.csv.gz"
+$dbIpSha256  = "e5c8459d638a272ece7f4d7cfa49dce18d91b4f403f6940ba9249bf0db3781fd"
+$geoCache    = Join-Path $env:TEMP "SettVPN-build-geoip"
+$dbIpGz      = Join-Path $geoCache "dbip.csv.gz"
+$geoBin      = Join-Path $geoCache "geoip.bin"
+
+if (-not (Test-Path $dbIpGz) -or (Get-Sha256Text $dbIpGz) -ne $dbIpSha256) {
+    Write-Host "Baixando GeoIP (DB-IP Lite $dbIpVersion)..." -ForegroundColor Cyan
+    New-Item -ItemType Directory -Path $geoCache -Force | Out-Null
+    Invoke-WebRequest -Uri $dbIpUrl -OutFile $dbIpGz -UseBasicParsing
+    $dbIpHash = Get-Sha256Text $dbIpGz
+    if ($dbIpHash -ne $dbIpSha256) {
+        Remove-Item $dbIpGz -Force -ErrorAction SilentlyContinue
+        Write-Host "FALHA: SHA256 do DB-IP nao confere (esperado $dbIpSha256, veio $dbIpHash)" -ForegroundColor Red
+        exit 1
+    }
+}
+
+if (-not (Test-Path $geoBin) -or (Get-Item $geoBin).LastWriteTime -lt (Get-Item $dbIpGz).LastWriteTime) {
+    Write-Host "Convertendo GeoIP ($dbIpVersion) para binario..." -ForegroundColor Cyan
+    # C#: o CSV tem ~1M linhas; laco em PowerShell levaria minutos.
+    Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Net;
+using System.Text;
+
+public static class SettVpnGeoIp
+{
+    public static int Convert(string gzPath, string outPath)
+    {
+        int count = 0;
+        using (FileStream fs = File.OpenRead(gzPath))
+        using (GZipStream gz = new GZipStream(fs, CompressionMode.Decompress))
+        using (StreamReader sr = new StreamReader(gz))
+        using (FileStream os = File.Create(outPath))
+        using (BinaryWriter bw = new BinaryWriter(os))
+        {
+            string line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                string[] p = line.Split(',');
+                if (p.Length < 3 || p[2].Length != 2) continue;
+                IPAddress a, b;
+                if (!IPAddress.TryParse(p[0], out a) || !IPAddress.TryParse(p[1], out b)) continue;
+                byte[] ab = a.GetAddressBytes();
+                byte[] bb = b.GetAddressBytes();
+                if (ab.Length != 4 || bb.Length != 4) continue;
+                bw.Write((uint)((ab[0] << 24) | (ab[1] << 16) | (ab[2] << 8) | ab[3]));
+                bw.Write((uint)((bb[0] << 24) | (bb[1] << 16) | (bb[2] << 8) | bb[3]));
+                byte[] cc = Encoding.ASCII.GetBytes(p[2].ToUpperInvariant());
+                bw.Write(cc[0]);
+                bw.Write(cc[1]);
+                count++;
+            }
+        }
+        return count;
+    }
+}
+"@
+    $geoCount = [SettVpnGeoIp]::Convert($dbIpGz, $geoBin)
+    Write-Host "OK: geoip.bin ($geoCount registros, $([math]::Round((Get-Item $geoBin).Length/1MB,1)) MB)" -ForegroundColor Green
+}
+if (-not (Test-Path $geoBin)) { Write-Host "FALHA ao gerar geoip.bin" -ForegroundColor Red; exit 1 }
 
 # ---- compila ----
+# Versao do exe: tag do git (vX.Y.Z) ou SETTVPN_VERSION no CI. O Windows exige 4 partes.
+$version = $env:SETTVPN_VERSION
+if (-not $version) {
+    try { $version = (& git -C $root describe --tags --abbrev=0 2>$null) } catch { }
+}
+$version = ([string]$version).Trim() -replace '^v', ''
+if ($version -notmatch '^\d+\.\d+\.\d+') { $version = '1.0.0' }
+$asmVersion = "$version.0"
+$manifestVersioned = Join-Path $env:TEMP "SettVPN-manifest-$PID.xml"
+# Sem BOM: manifest embutido com BOM quebra o SxS na inicializacao ("side-by-side configuration is incorrect").
+$manifestXml = (Get-Content $manifest -Raw) -replace '<assemblyIdentity version="[0-9.]+"', "<assemblyIdentity version=`"$asmVersion`""
+[System.IO.File]::WriteAllText($manifestVersioned, $manifestXml, (New-Object System.Text.UTF8Encoding($false)))
+
+# Without these attributes the exe reports 0.0.0.0 in Explorer/Properties.
+$asmInfo = Join-Path $env:TEMP "SettVPN-AssemblyInfo-$PID.cs"
+@"
+using System.Reflection;
+[assembly: AssemblyTitle("SETT VPN")]
+[assembly: AssemblyProduct("SETT VPN")]
+[assembly: AssemblyVersion("$asmVersion")]
+[assembly: AssemblyFileVersion("$asmVersion")]
+[assembly: AssemblyInformationalVersion("$version")]
+"@ | Set-Content -Path $asmInfo -Encoding UTF8
+
 $csc = "C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"
 if (-not (Test-Path $csc)) { $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" }
 
@@ -217,10 +337,16 @@ if (-not (Test-Path $psAsm)) {
 }
 if (-not (Test-Path $psAsm)) { Write-Host "FALTA System.Management.Automation.dll" -ForegroundColor Red; exit 1 }
 
-Write-Host "Compilando SettVPN.exe (self-contained, requer administrador)..." -ForegroundColor Cyan
-& $csc /nologo /target:winexe /win32icon:"$icoPath" /win32manifest:"$manifest" /out:"$out" "$src" `
+Write-Host "Compilando SettVPN.exe $asmVersion (self-contained, pede admin no launch)..." -ForegroundColor Cyan
+& $csc /nologo /target:winexe /win32icon:"$icoPath" /win32manifest:"$manifestVersioned" /out:"$out" "$src" "$asmInfo" `
     /r:"$psAsm" `
-    /resource:"$fullPs1" /resource:"$guiPs1" /resource:"$winIco" /resource:"$v2rayExe" /resource:"$wintunDll"
+    /resource:"$fullPs1" /resource:"$guiPs1" /resource:"$winIco" /resource:"$v2rayExe" /resource:"$wintunDll" /resource:"$geoBin"
+
+# Sem isso um erro do csc (ex.: exe em uso) ainda imprimia "OK" com o binario antigo no disco.
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "FALHOU ao compilar (csc exit $LASTEXITCODE)" -ForegroundColor Red
+    exit 1
+}
 
 if (Test-Path $out) {
     Write-Host "OK: $out" -ForegroundColor Green

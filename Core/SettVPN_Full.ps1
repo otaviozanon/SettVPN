@@ -1,4 +1,4 @@
-﻿# SettVPN - Automated VPN Connection Manager
+# SettVPN - Automated VPN Connection Manager
 # Uses abc-configs free VPN servers with embedded v2ray-core
 
 param([switch]$Console)
@@ -24,9 +24,90 @@ $Script:V2RayProcess = $null
 $Script:CurrentConfig = $null
 $Script:LastFailReason = ""
 $Script:TunStopFile = $null
+$Script:TunStateFile = Join-Path $Script:TempDir "tun-active.json"
+$Script:TunReadyFile = Join-Path $Script:TempDir "tun-ready.txt"
+$Script:AppLog = Join-Path $Script:TempDir "settvpn.log"
+$Script:KillSwitchBackup = Join-Path $Script:TempDir "killswitch-backup.json"
+$Script:SplitFile = Join-Path $Script:TempDir "split-direct.txt"
+$Script:GeoIpFile = Join-Path $Script:TempDir "geoip.bin"
+$Script:GeoIpData = $null
+$Script:SocksPort = 10808
+$Script:HttpPort = 10809
+$Script:ApiPort = 10085
+$Script:ScanPortBase = 20000
+$Script:ExitIp = ""
+$Script:KillSwitch = $false
+$Script:FuncSource = $null
 $Script:AbcConfigsUrl = "https://raw.githubusercontent.com/FreeFolksOn/abc-configs-free-vpn-proxy-list/main/README.md"
 $Script:SubConfigsUrl = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
 $Script:Sub2ConfigsUrl = "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt"
+
+# Codigo do kill switch. Roda SOMENTE no supervisor elevado (e no restaurador avulso):
+# fica em string para ser injetado por -EncodedCommand, nunca como .ps1 gravavel.
+# Entrada por variaveis de ambiente (SETTVPN_*) para nao depender de escaping.
+$Script:KillSwitchFuncs = @'
+function Restore-SettVpnFirewall {
+    $backup = $env:SETTVPN_KS_BACKUP
+    $restored = $false
+    if ($backup -and (Test-Path -LiteralPath $backup)) {
+        try {
+            $b = Get-Content -LiteralPath $backup -Raw | ConvertFrom-Json
+            # Primeiro devolve a politica de saida: janela sem bloqueio e melhor que
+            # janela sem as regras de permissao.
+            foreach ($p in @($b.Profiles)) {
+                Set-NetFirewallProfile -Profile $p.Name -DefaultOutboundAction $p.Action -ErrorAction Stop
+            }
+            $restored = $true
+        }
+        catch { }
+    }
+    else { $restored = $true }
+
+    if ($restored) {
+        try { Remove-NetFirewallRule -Group 'SettVPN KillSwitch' -ErrorAction Stop } catch { }
+        if ($backup) { Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue }
+    }
+    return $restored
+}
+
+function Enable-SettVpnKillSwitch {
+    $backup = $env:SETTVPN_KS_BACKUP
+    $xray = $env:SETTVPN_XRAY
+    if (-not $backup -or -not $xray) { return $false }
+    if (Test-Path -LiteralPath $backup) { return $false }
+
+    $profiles = @()
+    foreach ($p in @(Get-NetFirewallProfile -ErrorAction Stop)) {
+        $profiles += @{ Name = [string]$p.Name; Action = [string]$p.DefaultOutboundAction }
+    }
+    $json = @{ Profiles = $profiles } | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($backup, $json, (New-Object System.Text.UTF8Encoding($false)))
+
+    try {
+        $group = 'SettVPN KillSwitch'
+        try { Remove-NetFirewallRule -Group $group -ErrorAction Stop } catch { }
+        # xray precisa discar para o servidor mesmo com a saida bloqueada.
+        New-NetFirewallRule -DisplayName 'SettVPN KS: xray' -Group $group -Direction Outbound -Action Allow -Program $xray -Profile Any -ErrorAction Stop | Out-Null
+        # Proxy local e API de estatisticas.
+        New-NetFirewallRule -DisplayName 'SettVPN KS: loopback' -Group $group -Direction Outbound -Action Allow -RemoteAddress 127.0.0.1,::1 -Profile Any -ErrorAction Stop | Out-Null
+        # Pacotes que entram no adaptador TUN vem de processos sem regra propria: sem
+        # esta permissao o modo TUN morre junto com o firewall.
+        $aliases = @(Get-NetAdapter -ErrorAction Stop | Where-Object { $_.InterfaceDescription -match 'Wintun' } | ForEach-Object { $_.Name })
+        foreach ($alias in $aliases) {
+            New-NetFirewallRule -DisplayName "SettVPN KS: tun $alias" -Group $group -Direction Outbound -Action Allow -InterfaceAlias $alias -Profile Any -ErrorAction Stop | Out-Null
+        }
+        foreach ($p in $profiles) {
+            Set-NetFirewallProfile -Profile $p.Name -DefaultOutboundAction Block -ErrorAction Stop
+        }
+        return $true
+    }
+    catch {
+        [void](Restore-SettVpnFirewall)
+        return $false
+    }
+}
+'@
+
 
 # ============================================================
 # V2RAY - extraido pelo launcher (SettVPN.exe) para %TEMP%\SettVPN\v2ray.exe
@@ -35,6 +116,14 @@ $Script:Sub2ConfigsUrl = "https://raw.githubusercontent.com/peasoft/NoMoreWalls/
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
+
+function Write-AppLog {
+    param([string]$Message, [string]$Type = "INFO")
+    try {
+        Add-Content -Path $Script:AppLog -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Type] $Message" -Encoding UTF8 -ErrorAction Stop
+    }
+    catch { }
+}
 
 function Write-Status {
     param([string]$Message, [string]$Type = "INFO")
@@ -56,6 +145,109 @@ function Write-Status {
     }
     
     Write-Host "$prefix $Message" -ForegroundColor $color
+    Write-AppLog -Message $Message -Type $Type
+}
+
+function Get-ScriptPort {
+    param([string]$Name, [int]$Default)
+    $v = Get-Variable -Name $Name -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($v -and [int]$v -gt 0) { return [int]$v }
+    return $Default
+}
+
+function Get-FreePort {
+    param([int]$Start = 10808, [int[]]$Exclude = @())
+
+    for ($p = $Start; $p -lt ($Start + 200); $p++) {
+        if ($Exclude -contains $p) { continue }
+        $listener = $null
+        try {
+            $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $p)
+            $listener.Start()
+            return $p
+        }
+        catch { }
+        finally { if ($listener) { try { $listener.Stop() } catch { } } }
+    }
+    return $Start
+}
+
+function Test-LocalPort {
+    param([int]$Port = 0, [int]$TimeoutMs = 700)
+    if ($Port -le 0) { $Port = Get-ScriptPort 'HttpPort' 10809 }
+
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $ar = $client.BeginConnect("127.0.0.1", $Port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $client.EndConnect($ar)
+        return $true
+    }
+    catch { return $false }
+    finally { if ($client) { try { $client.Close() } catch { } } }
+}
+
+function Restore-OrphanTun {
+    if (-not (Test-Path $Script:TunStateFile)) { return }
+
+    # Execucao anterior caiu com TUN ativo: o supervisor elevado pode estar orfao.
+    try {
+        $stopFile = Join-Path $Script:TempDir "tun-stop.txt"
+        New-Item -Path $stopFile -ItemType File -Force | Out-Null
+        Start-Sleep -Seconds 2
+        Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
+    }
+    catch { }
+    Remove-Item $Script:TunStateFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $Script:TunReadyFile -Force -ErrorAction SilentlyContinue
+    Write-Status "Previous TUN session stopped" "WARN"
+}
+
+function Test-KillSwitchActive {
+    return [bool]($Script:KillSwitchBackup -and (Test-Path $Script:KillSwitchBackup))
+}
+
+function Restore-OrphanKillSwitch {
+    # Firewall com saida bloqueada sobrou de uma execucao que morreu. Sem isso o
+    # usuario fica sem internet ate restaurar o perfil na mao.
+    if (-not (Test-Path $Script:KillSwitchBackup)) { return }
+
+    $code = $Script:KillSwitchFuncs + "`n[void](Restore-SettVpnFirewall)"
+    $env:SETTVPN_KS_BACKUP = $Script:KillSwitchBackup
+    try {
+        if (Test-IsAdmin) {
+            & ([scriptblock]::Create($code)) | Out-Null
+        }
+        else {
+            Write-Status "Restoring firewall (kill switch) from the previous run..." "WARN"
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($code))
+            $p = Start-Process powershell -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+            [void]$p.WaitForExit(20000)
+        }
+    }
+    catch {
+        Write-Status "FAILED to restore the firewall: accept UAC or restore the outbound profile in Windows Defender Firewall" "ERROR"
+    }
+    finally {
+        Remove-Item Env:\SETTVPN_KS_BACKUP -ErrorAction SilentlyContinue
+    }
+
+    if (Test-Path $Script:KillSwitchBackup) {
+        Write-Status "Firewall STILL blocking (kill switch) - restore the outbound profile manually" "ERROR"
+    }
+    else {
+        Write-Status "Firewall restored" "OK"
+    }
+}
+
+function Stop-OrphanXray {
+    try {
+        Get-Process -Name "v2ray" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $Script:V2RayExe } |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    catch { }
 }
 
 function Initialize-Environment {
@@ -63,6 +255,25 @@ function Initialize-Environment {
         New-Item -ItemType Directory -Path $Script:TempDir -Force | Out-Null
         Write-Status "Created temp directory: $Script:TempDir" "OK"
     }
+
+    if (Test-Path $Script:AppLog) {
+        try {
+            if ((Get-Item $Script:AppLog).Length -gt 1MB) {
+                Move-Item $Script:AppLog "$($Script:AppLog).old" -Force
+            }
+        }
+        catch { }
+    }
+
+    Restore-OrphanTun
+    Restore-OrphanKillSwitch
+    Stop-OrphanXray
+
+    $Script:SocksPort = Get-FreePort -Start 10808
+    $Script:HttpPort = Get-FreePort -Start ($Script:SocksPort + 1) -Exclude @($Script:SocksPort)
+    $Script:ApiPort = Get-FreePort -Start 10085 -Exclude @($Script:SocksPort, $Script:HttpPort)
+    Write-Status "Proxy local: SOCKS5 127.0.0.1:$($Script:SocksPort) | HTTP 127.0.0.1:$($Script:HttpPort)" "INFO"
+
     Restore-OrphanProxy
 }
 
@@ -80,13 +291,69 @@ function Extract-V2Ray {
 # CONFIG PARSER FUNCTIONS
 # ============================================================
 
+function ConvertTo-PsLiteral {
+    param([string]$Value)
+    return "'" + ([string]$Value).Replace("'", "''") + "'"
+}
+
+function ConvertTo-HostValue {
+    param([string]$HostValue)
+    if ($HostValue -match '^\[(.+)\]$') { return $matches[1] }
+    return $HostValue
+}
+
+function ConvertFrom-Base64Text {
+    param([string]$Text)
+
+    if (-not $Text) { return $null }
+    $t = $Text.Trim().Replace('-', '+').Replace('_', '/')
+    while ($t.Length % 4 -ne 0) { $t += '=' }
+    try { return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($t)) }
+    catch { return $null }
+}
+
+function Split-HostPort {
+    param([string]$Endpoint)
+
+    if ($Endpoint -match '^\[([^\]]+)\]:(\d+)$') { return @{ Host = $matches[1]; Port = [int]$matches[2] } }
+    if ($Endpoint -match '^(.+):(\d+)$') { return @{ Host = $matches[1]; Port = [int]$matches[2] } }
+    return $null
+}
+
+function Get-PropOr {
+    param($Object, [string]$Name, $Default = $null)
+
+    # ConvertFrom-Json + StrictMode: campo opcional ausente faz acesso direto estourar.
+    $p = $Object.PSObject.Properties[$Name]
+    if ($p -and $null -ne $p.Value) { return $p.Value }
+    return $Default
+}
+
+function Get-ConfigKey {
+    param([hashtable]$Config)
+
+    # Indexer: hashtables de protocolos diferentes tem chaves diferentes (SS nao tem UUID).
+    $vals = foreach ($name in @('Protocol', 'Host', 'Port', 'UUID', 'Password', 'Method', 'Network', 'Params', 'WsPath', 'WsHost', 'TLS', 'SNI')) {
+        [string]$Config[$name]
+    }
+    return ($vals -join '|')
+}
+
+function Get-HashValue {
+    param([hashtable]$Table, [string]$Name, $Default = $null)
+
+    # StrictMode: ler chave ausente de hashtable estoura (campo opcional de vmess).
+    if ($Table -and $Table.ContainsKey($Name) -and $null -ne $Table[$Name]) { return $Table[$Name] }
+    return $Default
+}
+
 function Parse-VlessConfig {
     param([string]$Uri)
     
     try {
-        if ($Uri -match '^vless://([^@]+)@([^:]+):(\d+)(?:\?(.*?))?(?:#(.*))?$') {
+        if ($Uri -match '^vless://([^@]+)@(\[[0-9A-Fa-f:.]+\]|[^:/?#]+):(\d+)(?:\?(.*?))?(?:#(.*))?$') {
             $uuid = $matches[1]
-            $srvHost = $matches[2]
+            $srvHost = ConvertTo-HostValue $matches[2]
             $port = [int]$matches[3]
             $params = ""
             $name = $srvHost
@@ -119,44 +386,58 @@ function Parse-VlessConfig {
 
 function Parse-ShadowsocksConfig {
     param([string]$Uri)
-    
+
     try {
-        if ($Uri -match '^ss://([^@]+)@([^:]+):(\d+)(?:\?(.*?))?(?:#(.*))?$') {
-            $encoded = $matches[1]
-            $srvHost = $matches[2]
-            $port = [int]$matches[3]
-            $params = ""
-            $name = $srvHost
-            if ($matches[4]) { $params = $matches[4] }
-            if ($matches[5]) { $name = Unescape-Safe $matches[5] }
-            
-            # Try to decode base64
-            try {
-                $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))
-                if ($decoded -match '^([^:]+):(.+)$') {
-                    $method = $matches[1]
-                    $password = $matches[2]
-                }
-                else {
-                    $method = "unknown"
-                    $password = $encoded
-                }
+        if ($Uri -notmatch '^ss://(.+)$') { return $null }
+        $body = $matches[1]
+
+        $name = ""
+        if ($body -match '^(.*?)#(.*)$') {
+            $body = $matches[1]
+            $name = Unescape-Safe $matches[2]
+        }
+        if ($body -match '^(.*?)\?(.*)$') { $body = $matches[1] }
+
+        $method = ""
+        $password = ""
+        $endpoint = ""
+
+        # SIP002: ss://base64(method:pass)@host:port ou ss://method:pass@host:port
+        if ($body -match '^([^@]+)@(.+)$') {
+            $credRaw = $matches[1]
+            $endpoint = $matches[2]
+            $cred = ConvertFrom-Base64Text $credRaw
+            if (-not $cred) { $cred = Unescape-Safe $credRaw }
+            if ($cred -match '^([^:]+):(.+)$') {
+                $method = $matches[1]
+                $password = $matches[2]
             }
-            catch {
-                $method = "unknown"
-                $password = $encoded
+        }
+        else {
+            # Formato legado: ss://base64(method:pass@host:port)
+            $decoded = ConvertFrom-Base64Text $body
+            if ($decoded -and $decoded -match '^([^:]+):(.+)@(.+)$') {
+                $method = $matches[1]
+                $password = $matches[2]
+                $endpoint = $matches[3]
             }
-            
-            return @{
-                Protocol = "shadowsocks"
-                Method = $method
-                Password = $password
-                Host = $srvHost
-                Port = $port
-                Params = $params
-                Name = $name
-                Raw = $Uri
-            }
+        }
+
+        if (-not $method -or -not $endpoint) { return $null }
+        $hp = Split-HostPort $endpoint
+        if (-not $hp) { return $null }
+        if ($hp.Port -le 0 -or $hp.Port -gt 65535) { return $null }
+        if (-not $name) { $name = $hp.Host }
+
+        return @{
+            Protocol = "shadowsocks"
+            Method = $method
+            Password = $password
+            Host = $hp.Host
+            Port = [int]$hp.Port
+            Params = ""
+            Name = $name
+            Raw = $Uri
         }
     }
     catch {
@@ -170,9 +451,9 @@ function Parse-TrojanConfig {
     param([string]$Uri)
 
     try {
-        if ($Uri -match '^trojan://([^@]+)@([^:]+):(\d+)(?:\?(.*?))?(?:#(.*))?$') {
+        if ($Uri -match '^trojan://([^@]+)@(\[[0-9A-Fa-f:.]+\]|[^:/?#]+):(\d+)(?:\?(.*?))?(?:#(.*))?$') {
             $password = $matches[1]
-            $srvHost = $matches[2]
+            $srvHost = ConvertTo-HostValue $matches[2]
             $port = [int]$matches[3]
             $params = ""
             $name = $srvHost
@@ -203,26 +484,37 @@ function Parse-VmessConfig {
     try {
         # Format: vmess://base64encodedJSON
         if ($Uri -match 'vmess://(.+)') {
-            $base64 = $matches[1]
-            $decoded = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($base64))
+            $decoded = ConvertFrom-Base64Text $matches[1]
+            if (-not $decoded) { return $null }
             $json = $decoded | ConvertFrom-Json
 
+            $id = [string](Get-PropOr $json 'id' '')
             $guid = [guid]::Empty
-            if (-not [guid]::TryParse([string]$json.id, [ref]$guid)) {
-                Write-Status "Skipping VMess config with non-UUID id: $($json.id)" "WARN"
+            if (-not [guid]::TryParse($id, [ref]$guid)) {
+                Write-Status "Skipping VMess config with non-UUID id: $id" "WARN"
                 return $null
             }
 
+            $srvHost = ConvertTo-HostValue ([string](Get-PropOr $json 'add' ''))
+            $port = [int](Get-PropOr $json 'port' 0)
+            if (-not $srvHost -or $port -le 0 -or $port -gt 65535) { return $null }
+
             return @{
                 Protocol = "vmess"
-                Host = $json.add
-                Port = [int]$json.port
-                UUID = $json.id
-                AlterID = $json.aid
-                Network = $json.net
-                Type = $json.type
-                Security = $json.scy
-                Name = $json.ps
+                Host = $srvHost
+                Port = $port
+                UUID = $id
+                AlterID = [int](Get-PropOr $json 'aid' 0)
+                Network = [string](Get-PropOr $json 'net' 'tcp')
+                Type = [string](Get-PropOr $json 'type' 'none')
+                Security = [string](Get-PropOr $json 'scy' 'auto')
+                TLS = [string](Get-PropOr $json 'tls' '')
+                SNI = [string](Get-PropOr $json 'sni' '')
+                WsHost = [string](Get-PropOr $json 'host' '')
+                WsPath = [string](Get-PropOr $json 'path' '/')
+                Alpn = [string](Get-PropOr $json 'alpn' '')
+                Fingerprint = [string](Get-PropOr $json 'fp' '')
+                Name = [string](Get-PropOr $json 'ps' $srvHost)
                 Raw = $Uri
             }
         }
@@ -294,6 +586,15 @@ function Get-ShortName {
 
     # Encurta nomes de servidor (listas livres usam nomes muito longos) pra log nao cortar.
     if (-not $Name) { return "" }
+    # Bandeiras/emoji das listas nao tem glifo em toda fonte e aparecem como quadrado.
+    $Name = $Name -replace '[\uD800-\uDFFF\uFE0F\u2600-\u27BF\u2B00-\u2BFF]', ''
+    # As listas metem host e protocolo no nome: "DE[www.v2nodes.com] vless-DE-1 #6".
+    $clean = ($Name -replace '\[[^\]]*\]', '' -replace '\s*@[A-Za-z0-9_.-]+$', '' -replace '\b(vless|vmess|trojan|shadowsocks)[-_ ]', '' -replace '\s+', ' ').Trim().TrimEnd('|', '-', '_', ' ')
+    # Nome so com protocolo/host: usa o host em vez de devolver o nome cru.
+    if (-not $clean) {
+        $hostMatch = [regex]::Match($Name, '\[([^\]]+)\]')
+        $clean = if ($hostMatch.Success) { $hostMatch.Groups[1].Value } else { $Name.Trim() }
+    }    if ($clean) { $Name = $clean }
     if ($Name.Length -le $Max) { return $Name }
     return $Name.Substring(0, [Math]::Max(1, $Max - 3)).TrimEnd() + "..."
 }
@@ -351,25 +652,37 @@ function Get-AllConfigs {
         Write-Status "$($src.Label): $count found" "INFO"
     }
 
-    # Dedup: remove espelhos (mesmo protocolo+host+porta vindos de agregadores diferentes)
+    # Dedup: remove espelhos reais (mesma credencial/transporte/host/porta).
+    # Nao use so host:porta: nos nos CDN (Cloudflare) varios UUIDs diferem e todos funcionam.
     $seen = @{}
     $unique = @()
     foreach ($cfg in $configs) {
-        $key = "$($cfg.Protocol)|$($cfg.Host)|$($cfg.Port)"
+        $key = Get-ConfigKey -Config $cfg
         if (-not $seen.ContainsKey($key)) {
             $seen[$key] = $true
             $unique += $cfg
         }
     }
     $dupes = $configs.Count - $unique.Count
-    if ($dupes -gt 0) { Write-Status "Removidos $dupes duplicados (espelhos)" "INFO" }
+    if ($dupes -gt 0) { Write-Status "Removed $dupes duplicate configs (mirrors)" "INFO" }
     $configs = $unique
 
     if ($configs.Count -gt 400) {
         $configs = @($configs[0..399])
     }
-    Write-Status "Found $($configs.Count) configs (apos filtro)" "INFO"
+    Write-Status "Found $($configs.Count) configs (after filtering)" "INFO"
     return $configs
+}
+
+function Get-ServerPingMs {
+    param($Config)
+    # RealPing = HTTP 204 medido dentro do tunel (o que o usuario sente). Ping =
+    # TCP ate o servidor e mente: CDN responde rapido e o caminho do proxy esta morto.
+    if ($Config.ContainsKey('RealPing')) {
+        $rp = [int]$Config['RealPing']
+        if ($rp -gt 0 -and $rp -lt 9999) { return $rp }
+    }
+    return [int]$Config['Ping']
 }
 
 function Get-ServerPool {
@@ -404,69 +717,75 @@ function Get-ServerPool {
 # ============================================================
 
 function Get-ConfigsWithPing {
-    param([array]$Configs)
+    param([array]$Configs, [int]$BatchSize = 64)
 
     $n = $Configs.Count
     Write-Status "Testing connectivity for $n configs..." "INFO"
 
     $timeoutMs = 3000
 
-    $tcpArr = [object[]]::new($n)
-    $swArr  = [object[]]::new($n)
-    $arArr  = [object[]]::new($n)
-    $done   = [bool[]]::new($n)
+    # Conecta em lotes: centenas de SYNs simultaneos saturam NAT/portas efemeras.
+    for ($offset = 0; $offset -lt $n; $offset += $BatchSize) {
+        $end = [Math]::Min($offset + $BatchSize, $n) - 1
+        $batch = @($Configs[$offset..$end])
+        $bn = $batch.Count
 
-    # fire all TCP connects at once (non-blocking)
-    for ($i = 0; $i -lt $n; $i++) {
-        $cfg = $Configs[$i]
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        $tcp = New-Object System.Net.Sockets.TcpClient
-        try {
-            $ar = $tcp.BeginConnect($cfg.Host, $cfg.Port, $null, $null)
-            $tcpArr[$i] = $tcp
-            $swArr[$i] = $sw
-            $arArr[$i] = $ar
-        }
-        catch {
-            $sw.Stop()
-            $cfg.Ping = 9999
-            $done[$i] = $true
-            $tcp.Close()
-        }
-    }
+        $tcpArr = [object[]]::new($bn)
+        $swArr  = [object[]]::new($bn)
+        $arArr  = [object[]]::new($bn)
+        $done   = [bool[]]::new($bn)
 
-    # collect results as they complete (poll every 20ms, shared deadline)
-    $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
-    $remaining = $n
-    while ($remaining -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
-        for ($i = 0; $i -lt $n; $i++) {
-            if ($done[$i] -or $null -eq $arArr[$i]) { continue }
-            if ($arArr[$i].IsCompleted) {
-                $cfg = $Configs[$i]
-                try {
-                    $tcpArr[$i].EndConnect($arArr[$i])
-                    $swArr[$i].Stop()
-                    $cfg.Ping = [int]$swArr[$i].ElapsedMilliseconds
-                }
-                catch {
-                    $swArr[$i].Stop()
-                    $cfg.Ping = 9999
-                }
-                finally {
-                    $tcpArr[$i].Close()
-                }
+        for ($i = 0; $i -lt $bn; $i++) {
+            $cfg = $batch[$i]
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            try {
+                $ar = $tcp.BeginConnect($cfg.Host, $cfg.Port, $null, $null)
+                $tcpArr[$i] = $tcp
+                $swArr[$i] = $sw
+                $arArr[$i] = $ar
+            }
+            catch {
+                $sw.Stop()
+                $cfg.Ping = 9999
                 $done[$i] = $true
-                $remaining--
+                $tcp.Close()
             }
         }
-        if ($remaining -gt 0) { Start-Sleep -Milliseconds 20 }
-    }
 
-    # anything still not done -> unreachable
-    for ($i = 0; $i -lt $n; $i++) {
-        if (-not $done[$i]) {
-            $Configs[$i].Ping = 9999
-            if ($null -ne $tcpArr[$i]) { try { $tcpArr[$i].Close() } catch {} }
+        # collect results as they complete (poll every 20ms, shared deadline)
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+        $remaining = $bn
+        while ($remaining -gt 0 -and [DateTime]::UtcNow -lt $deadline) {
+            for ($i = 0; $i -lt $bn; $i++) {
+                if ($done[$i] -or $null -eq $arArr[$i]) { continue }
+                if ($arArr[$i].IsCompleted) {
+                    $cfg = $batch[$i]
+                    try {
+                        $tcpArr[$i].EndConnect($arArr[$i])
+                        $swArr[$i].Stop()
+                        $cfg.Ping = [int]$swArr[$i].ElapsedMilliseconds
+                    }
+                    catch {
+                        $swArr[$i].Stop()
+                        $cfg.Ping = 9999
+                    }
+                    finally {
+                        $tcpArr[$i].Close()
+                    }
+                    $done[$i] = $true
+                    $remaining--
+                }
+            }
+            if ($remaining -gt 0) { Start-Sleep -Milliseconds 20 }
+        }
+
+        # anything still not done -> unreachable
+        for ($i = 0; $i -lt $bn; $i++) {
+            if (-not $done[$i]) {
+                $batch[$i].Ping = 9999
+                if ($null -ne $tcpArr[$i]) { try { $tcpArr[$i].Close() } catch {} }
+            }
         }
     }
 
@@ -530,6 +849,7 @@ function New-StreamSettings {
     if ($security -eq "tls") {
         $tls = @{}
         $sni = Get-ParamValue $P "sni"
+        if (-not $sni) { $sni = Get-ParamValue $P "host" }
         if ($sni) { $tls.serverName = $sni }
         $alpn = Get-ParamValue $P "alpn"
         if ($alpn) { $tls.alpn = @($alpn -split ',') }
@@ -552,7 +872,20 @@ function New-StreamSettings {
         $stream.realitySettings = $r
     }
 
-    if ($network -eq "ws") {
+    if ($network -eq "tcp") {
+        $headerType = Get-ParamValue $P "headerType"
+        if ($headerType -eq "http") {
+            $tcp = @{ header = @{ type = "http" } }
+            $req = @{}
+            $path = Get-ParamValue $P "path"
+            if ($path) { $req.path = @($path) }
+            $hdr = Get-ParamValue $P "host"
+            if ($hdr) { $req.headers = @{ Host = @($hdr) } }
+            if ($req.Count -gt 0) { $tcp.header.request = $req }
+            $stream.tcpSettings = $tcp
+        }
+    }
+    elseif ($network -eq "ws") {
         $ws = @{}
         $path = Get-ParamValue $P "path"
         if ($path) { $ws.path = $path }
@@ -580,29 +913,120 @@ function New-StreamSettings {
     return $stream
 }
 
+function Format-Bytes {
+    param([int64]$Bytes = 0)
+    if ($Bytes -lt 1024) { return "$Bytes B" }
+    $v = [double]$Bytes
+    foreach ($u in @('KB', 'MB', 'GB', 'TB')) {
+        $v = $v / 1024
+        if ($v -lt 1024) { return ('{0:0.0} {1}' -f $v, $u) }
+    }
+    return ('{0:0.0} PB' -f $v)
+}
+
+function Get-SplitDirectLines {
+    $file = [string](Get-Variable -Name SplitFile -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+    if (-not $file -or -not (Test-Path $file)) { return @() }
+    try {
+        return @(Get-Content -LiteralPath $file -ErrorAction Stop | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') })
+    }
+    catch { return @() }
+}
+
+function New-SplitRoutingRules {
+    param([string[]]$Lines = @(), [switch]$NoLocal)
+
+    $domains = New-Object 'System.Collections.Generic.List[string]'
+    $ips = New-Object 'System.Collections.Generic.List[string]'
+
+    # Faixas locais nunca podem ir para o proxy em modo TUN (LAN, link-local, loopback).
+    # Sem geoip.dat embarcado: CIDRs explicitos.
+    if (-not $NoLocal) {
+        foreach ($c in @('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '169.254.0.0/16', '127.0.0.0/8', '100.64.0.0/10', 'fc00::/7', 'fe80::/10', '::1/128')) {
+            $ips.Add($c)
+        }
+    }
+
+    foreach ($raw in @($Lines)) {
+        $line = ([string]$raw).Trim()
+        if (-not $line -or $line.StartsWith('#')) { continue }
+        if ($line -match '^(geoip|ext|geosite|domain|full|regexp|keyword):') {
+            if ($line.StartsWith('geoip:') -or $line.StartsWith('ext:')) { $ips.Add($line) } else { $domains.Add($line) }
+            continue
+        }
+        $addr = $line -replace '/.*$', ''
+        $parsed = $null
+        if ([System.Net.IPAddress]::TryParse($addr, [ref]$parsed)) {
+            if ($line.Contains('/')) { $ips.Add($line) } else { $ips.Add($addr) }
+        }
+        else { $domains.Add($line.ToLowerInvariant()) }
+    }
+
+    $rules = @()
+    # Condicoes no MESMO rule sao AND no Xray: dominio e IP precisam de rules separadas.
+    if ($domains.Count -gt 0) { $rules += @{ type = 'field'; domain = @($domains); outboundTag = 'direct' } }
+    if ($ips.Count -gt 0) { $rules += @{ type = 'field'; ip = @($ips); outboundTag = 'direct' } }
+    return $rules
+}
+
+function Get-TrafficStats {
+    param([int]$ApiPort = 0, [string]$Exe = "")
+
+    if ($ApiPort -le 0) { $ApiPort = Get-ScriptPort 'ApiPort' 10085 }
+    if (-not $Exe) { $Exe = [string](Get-Variable -Name V2RayExe -Scope Script -ValueOnly -ErrorAction SilentlyContinue) }
+    if (-not $Exe -or -not (Test-Path $Exe)) { return $null }
+
+    try {
+        $out = & $Exe api statsquery "--server=127.0.0.1:$ApiPort" 2>$null
+        $text = ([string]($out | Out-String)).Trim()
+        if (-not $text) { return $null }
+        $obj = $text | ConvertFrom-Json
+        if (-not $obj -or -not ($obj.PSObject.Properties.Name -contains 'stat')) { return $null }
+
+        $up = [int64]0
+        $down = [int64]0
+        foreach ($s in @($obj.stat)) {
+            if (-not $s.value) { continue }
+            # A propria consulta de stats conta no inbound api - ignorar.
+            if ($s.name -like 'inbound>>>api>>>*') { continue }
+            if ($s.name -like '*>>>traffic>>>uplink') { $up += [int64]$s.value }
+            elseif ($s.name -like '*>>>traffic>>>downlink') { $down += [int64]$s.value }
+        }
+        return @{ Up = $up; Down = $down }
+    }
+    catch { return $null }
+}
+
 function Generate-V2RayConfig {
-    param([hashtable]$Config, [bool]$Tun = $false, [int]$SocksPort = 10808, [int]$HttpPort = 10809, [string]$ConfigPath = "", [string]$LogPath = "")
+    param([hashtable]$Config, [bool]$Tun = $false, [int]$SocksPort = 0, [int]$HttpPort = 0, [string]$ConfigPath = "", [string]$LogPath = "", [int]$ApiPort = 0)
+
+    if ($SocksPort -le 0) { $SocksPort = Get-ScriptPort 'SocksPort' 10808 }
+    if ($HttpPort -le 0) { $HttpPort = Get-ScriptPort 'HttpPort' 10809 }
 
     if (-not $ConfigPath) { $ConfigPath = $Script:ConfigJson }
     if (-not $LogPath) { $LogPath = $Script:XrayLog }
 
     $configObj = @{
         log = @{
-            loglevel = "info"
+            loglevel = "warning"
             error    = $LogPath
         }
         inbounds = @(
             @{
+                listen   = "127.0.0.1"
                 port = $SocksPort
                 protocol = "socks"
+                tag      = "socks-in"
                 settings = @{
                     auth = "noauth"
                     udp = $true
                 }
             },
             @{
+                listen   = "127.0.0.1"
                 port = $HttpPort
                 protocol = "http"
+                tag      = "http-in"
                 settings = @{}
             }
         )
@@ -623,7 +1047,31 @@ function Generate-V2RayConfig {
         }
     }
 
-    $paramHash = ConvertTo-ParamHashtable -Params $Config.Params
+    $routingRules = @()
+
+    # Stats do xray: StatsService + inbound dokodemo-door na tag "api". O rule
+    # inboundTag->api e obrigatorio, sem ele o xray nem abre a porta.
+    if ($ApiPort -gt 0) {
+        $configObj.api = @{ tag = "api"; services = @("StatsService") }
+        $configObj.stats = @{}
+        $configObj.policy = @{ system = @{ statsInboundUplink = $true; statsInboundDownlink = $true } }
+        $configObj.inbounds += @{
+            listen   = "127.0.0.1"
+            port     = $ApiPort
+            protocol = "dokodemo-door"
+            settings = @{ address = "127.0.0.1" }
+            tag      = "api"
+        }
+        $routingRules += @{ type = "field"; inboundTag = @("api"); outboundTag = "api" }
+    }
+
+    # Split tunneling: dominios/IPs listados vao direto. Soh faz sentido em TUN
+    # (no modo proxy quem escolhe o destino e o app). Inclui as faixas locais.
+    if ($Tun) {
+        foreach ($r in @(New-SplitRoutingRules -Lines @(Get-SplitDirectLines))) { $routingRules += $r }
+    }
+
+    $paramHash = ConvertTo-ParamHashtable -Params ([string](Get-HashValue $Config 'Params' ''))
 
     if ((Get-ParamValue $paramHash "type" "tcp") -eq "xhttp") {
         Write-Status "Skipping config (transport xhttp not supported by this v2ray build)" "WARN"
@@ -632,22 +1080,29 @@ function Generate-V2RayConfig {
 
     if ($Config.Protocol -eq "vless") {
         $stream = New-StreamSettings -P $paramHash
+
+        $user = @{
+            id = $Config.UUID
+            encryption = (Get-ParamValue $paramHash "encryption" "none")
+        }
+        $flow = Get-ParamValue $paramHash "flow"
+        if ($flow) { $user.flow = $flow }
+
+        $vless = @{
+            vnext = @(
+                @{
+                    address = $Config.Host
+                    port = $Config.Port
+                    users = @($user)
+                }
+            )
+        }
+        $packetEncoding = Get-ParamValue $paramHash "packetEncoding"
+        if ($packetEncoding) { $vless.packetEncoding = $packetEncoding }
+
         $outbound = @{
             protocol = "vless"
-            settings = @{
-                vnext = @(
-                    @{
-                        address = $Config.Host
-                        port = $Config.Port
-                        users = @(
-                            @{
-                                id = $Config.UUID
-                                encryption = "none"
-                            }
-                        )
-                    }
-                )
-            }
+            settings = $vless
             streamSettings = $stream
         }
         $configObj.outbounds += $outbound
@@ -676,6 +1131,13 @@ function Generate-V2RayConfig {
     elseif ($Config.Protocol -eq "trojan") {
         $stream = New-StreamSettings -P $paramHash
         if ($stream.security -eq "none") { $stream.security = "tls" }
+        if ($stream.security -eq "tls") {
+            if (-not $stream.ContainsKey('tlsSettings')) { $stream.tlsSettings = @{} }
+            if (-not $stream.tlsSettings.ContainsKey('serverName')) {
+                $sni = Get-ParamValue $paramHash "sni" ([string]$Config.Host)
+                if ($sni) { $stream.tlsSettings.serverName = $sni }
+            }
+        }
         $outbound = @{
             protocol = "trojan"
             settings = @{
@@ -692,11 +1154,36 @@ function Generate-V2RayConfig {
         $configObj.outbounds += $outbound
     }
     elseif ($Config.Protocol -eq "vmess") {
-        $net = [string]$Config.Network
-        if ($net -and $net -ne "tcp") {
+        $net = [string](Get-HashValue $Config 'Network' 'tcp')
+        if (-not $net) { $net = "tcp" }
+        if ($net -notin @("tcp", "ws")) {
             Write-Status "Skipping unsupported VMess transport: $net" "WARN"
             return $false
         }
+
+        $stream = @{ network = $net }
+        $tls = [string](Get-HashValue $Config 'TLS' '')
+        if ($tls -eq "tls") {
+            $tlsObj = @{}
+            $sni = [string](Get-HashValue $Config 'SNI' '')
+            if (-not $sni) { $sni = [string](Get-HashValue $Config 'WsHost' '') }
+            if ($sni) { $tlsObj.serverName = $sni }
+            $alpn = [string](Get-HashValue $Config 'Alpn' '')
+            if ($alpn) { $tlsObj.alpn = @($alpn -split ',') }
+            $fp = [string](Get-HashValue $Config 'Fingerprint' '')
+            if ($fp) { $tlsObj.fingerprint = $fp }
+            $stream.security = "tls"
+            $stream.tlsSettings = $tlsObj
+        }
+        if ($net -eq "ws") {
+            $ws = @{}
+            $path = [string](Get-HashValue $Config 'WsPath' '')
+            if ($path) { $ws.path = $path }
+            $wsHost = [string](Get-HashValue $Config 'WsHost' '')
+            if ($wsHost) { $ws.headers = @{ Host = $wsHost } }
+            $stream.wsSettings = $ws
+        }
+
         $outbound = @{
             protocol = "vmess"
             settings = @{
@@ -707,18 +1194,23 @@ function Generate-V2RayConfig {
                         users = @(
                             @{
                                 id = $Config.UUID
-                                alterId = $Config.AlterID
-                                security = $Config.Security
+                                alterId = [int](Get-HashValue $Config 'AlterID' 0)
+                                security = (Get-HashValue $Config 'Security' 'auto')
                             }
                         )
                     }
                 )
             }
-            streamSettings = @{
-                network = if ($net) { $net } else { "tcp" }
-            }
+            streamSettings = $stream
         }
         $configObj.outbounds += $outbound
+    }
+
+    if ($Tun) {
+        $configObj.outbounds += @{ protocol = "freedom"; tag = "direct" }
+    }
+    if ($routingRules.Count -gt 0) {
+        $configObj.routing = @{ rules = @($routingRules) }
     }
 
     # Save to file
@@ -768,10 +1260,10 @@ function Test-ConfigStable {
         if ($params -match 'type=(grpc|xhttp)') { return $false }
     }
 
-    # VMess guarda o transport em Network (nao em Params); so tcp e suportado.
+    # VMess guarda o transport em Network (nao em Params); tcp e ws sao suportados.
     if ($Config['Protocol'] -eq 'vmess') {
         $net = [string]$Config['Network']
-        if ($net -and $net -ne 'tcp') { return $false }
+        if ($net -and $net -notin @('tcp', 'ws')) { return $false }
     }
 
     return $true
@@ -779,14 +1271,94 @@ function Test-ConfigStable {
 
 function Get-FuncSource {
     # Reconstroi o codigo-fonte das funcoes (p/ redefinir em runspaces paralelos).
+    $cached = Get-Variable -Name FuncSource -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($cached) { return $cached }
+
     $tokens = $null; $errs = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($Script:ScriptFile, [ref]$tokens, [ref]$errs)
     $funcs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
-    return (($funcs | ForEach-Object { $_.Extent.Text }) -join "`n`n")
+    $src = (($funcs | ForEach-Object { $_.Extent.Text }) -join "`n`n")
+    Set-Variable -Name FuncSource -Scope Script -Value $src
+    return $src
+}
+
+function Measure-TunnelHttpMs {
+    param([int]$SocksPort = 0, [int]$TimeoutMs = 4000)
+
+    # Latencia sentida pelo usuario: HTTP 204 atraves do SOCKS do xray.
+    if ($SocksPort -le 0) { $SocksPort = Get-ScriptPort 'SocksPort' 10808 }
+    $client = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $client.ReceiveTimeout = $TimeoutMs
+        $client.SendTimeout = $TimeoutMs
+        $ar = $client.BeginConnect("127.0.0.1", $SocksPort, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return 9999 }
+        $client.EndConnect($ar)
+        $stream = $client.GetStream()
+
+        $hello = [byte[]](5, 1, 0)
+        $stream.Write($hello, 0, 3)
+        $resp = New-Object byte[] 2
+        if ($stream.Read($resp, 0, 2) -lt 2 -or $resp[1] -ne 0) { return 9999 }
+
+        $domain = "cp.cloudflare.com"
+        $db = [System.Text.Encoding]::ASCII.GetBytes($domain)
+        $portBytes = [BitConverter]::GetBytes([UInt16]80)
+        [Array]::Reverse($portBytes)
+        $req = New-Object byte[] (7 + $db.Length)
+        $req[0] = 5; $req[1] = 1; $req[2] = 0; $req[3] = 3; $req[4] = [byte]$db.Length
+        [Array]::Copy($db, 0, $req, 5, $db.Length)
+        $req[5 + $db.Length] = $portBytes[0]
+        $req[6 + $db.Length] = $portBytes[1]
+        $stream.Write($req, 0, $req.Length)
+        $reply = New-Object byte[] 256
+        if ($stream.Read($reply, 0, 256) -lt 2 -or $reply[1] -ne 0) { return 9999 }
+
+        $http = "GET /generate_204 HTTP/1.1`r`nHost: $domain`r`nConnection: close`r`n`r`n"
+        $hb = [System.Text.Encoding]::ASCII.GetBytes($http)
+        $stream.Write($hb, 0, $hb.Length)
+        $buf = New-Object byte[] 64
+        if ($stream.Read($buf, 0, 64) -le 0) { return 9999 }
+        $sw.Stop()
+        return [int]$sw.ElapsedMilliseconds
+    }
+    catch { return 9999 }
+    finally { if ($client) { try { $client.Close() } catch { } } }
+}
+
+function Get-ExitIp {
+    param([int]$HttpPort = 0, [int]$TimeoutMs = 5000)
+
+    if ($HttpPort -le 0) { $HttpPort = Get-ScriptPort 'HttpPort' 10809 }
+    $proxy = "http://127.0.0.1:$HttpPort"
+    $timeoutSec = [int][Math]::Max(1, [Math]::Ceiling($TimeoutMs / 1000))
+
+    try {
+        $r = Invoke-RestMethod -Uri 'https://ipinfo.io/json' -Proxy $proxy -TimeoutSec $timeoutSec -ErrorAction Stop
+        if ($r.ip) {
+            if ($r.country) { return "$($r.ip) ($($r.country))" }
+            return [string]$r.ip
+        }
+    }
+    catch { }
+
+    try {
+        $ip = (Invoke-WebRequest -Uri 'https://api.ipify.org' -Proxy $proxy -TimeoutSec $timeoutSec -UseBasicParsing -ErrorAction Stop).Content.Trim()
+        if ($ip) { return $ip }
+    }
+    catch { }
+
+    return ""
 }
 
 function Test-ServerStable {
-    param([hashtable]$Config, [int]$SocksPort = 10808, [int]$HttpPort = 10809, [string]$ConfigPath = "", [string]$LogPath = "", [int]$StabilitySeconds = 6)
+    param([hashtable]$Config, [int]$SocksPort = 0, [int]$HttpPort = 0, [string]$ConfigPath = "", [string]$LogPath = "", [int]$StabilitySeconds = 6)
+
+    if ($SocksPort -le 0) { $SocksPort = Get-ScriptPort 'SocksPort' 10808 }
+    if ($HttpPort -le 0) { $HttpPort = Get-ScriptPort 'HttpPort' 10809 }
+    $Script:LastRealPing = 0
 
     # Teste isolado (porta/config/processo proprios) - nao toca em $Script:V2RayProcess/CurrentConfig.
     if (-not $ConfigPath) { $ConfigPath = Join-Path $Script:TempDir "config-scan-$SocksPort.json" }
@@ -803,14 +1375,13 @@ function Test-ServerStable {
         $psi.Arguments = "run -c `"$ConfigPath`""
         $psi.UseShellExecute = $false
         $psi.CreateNoWindow = $true
-        $psi.RedirectStandardOutput = $true
-        $psi.RedirectStandardError = $true
+        # Sem redirect: pipe nao drenado enche e trava o xray. O log vai pro arquivo.
 
         $proc = [System.Diagnostics.Process]::Start($psi)
 
-        # 1) prontidao: espera o tunel responder (poll ate ~6s, sem sleep cego)
+        # 1) prontidao: espera o tunel responder (poll ate ~3s, sem sleep cego)
         $ready = $false
-        $deadline = [DateTime]::UtcNow.AddSeconds(6)
+        $deadline = [DateTime]::UtcNow.AddSeconds(3)
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($proc.HasExited) { break }
             if (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500 -SocksPort $SocksPort) { $ready = $true; break }
@@ -827,7 +1398,14 @@ function Test-ServerStable {
         }
 
         # 3) UDP (Discord/voz, jogos, DNS usam UDP)
-        return (Test-V2RayUdp -TimeoutMs 2500 -SocksPort $SocksPort)
+        if (-not (Test-V2RayUdp -TimeoutMs 2500 -SocksPort $SocksPort)) { return $false }
+
+        # 4) latencia real: HTTP 204 atraves do tunel. O CONNECT do socks responde
+        # antes de discar (0 ms para alvo morto), o ping do banco e so TCP ate o
+        # servidor; so o dado voltando mede o que o usuario sente.
+        $pingMs = Measure-TunnelHttpMs -SocksPort $SocksPort -TimeoutMs 4000
+        $Script:LastRealPing = $pingMs
+        return ($pingMs -lt 9999)
     }
     catch {
         return $false
@@ -843,12 +1421,27 @@ function Test-ServerStable {
     }
 }
 
+function Get-SpreadSample {
+    param([array]$Items, [int]$Max = 12)
+
+    # Amostra espalhada: os servidores de menor ping costumam ser CDN com caminho
+    # morto; pegar so o topo fazia o teste/conexao falhar sempre.
+    if (-not $Items -or $Items.Count -le $Max) { return @($Items) }
+    $step = [Math]::Max(1, [int][Math]::Floor($Items.Count / $Max))
+    $picked = @()
+    for ($i = 0; $i -lt $Items.Count -and $picked.Count -lt $Max; $i += $step) { $picked += $Items[$i] }
+    return $picked
+}
+
 function Scan-StableServers {
-    param([array]$Configs, [int]$MaxToTest = 25, [int]$StabilitySeconds = 6, [int]$MinStable = 10, [int]$Concurrency = 5)
+    param([array]$Configs, [int]$MaxToTest = 40, [int]$StabilitySeconds = 2, [int]$MinStable = 10,
+          [int]$Concurrency = [Math]::Min(12, [Math]::Max(4, [Environment]::ProcessorCount)))
 
     $stable = @()
     $tested = 0
-    $total = [Math]::Min($Configs.Count, $MaxToTest)
+    if (-not $Configs -or $Configs.Count -eq 0) { return $stable }
+    $Configs = @(Get-SpreadSample -Items $Configs -Max $MaxToTest)
+    $total = $Configs.Count
     if ($total -le 0) { return $stable }
     $scanSw = [System.Diagnostics.Stopwatch]::StartNew()
     if ($Sync) {
@@ -864,32 +1457,33 @@ function Scan-StableServers {
     catch { }
 
     $funcSource = Get-FuncSource
-    $offset = 0
-    while ($offset -lt $total -and ($MinStable -le 0 -or $stable.Count -lt $MinStable)) {
-        $batch = @()
-        for ($j = 0; $j -lt $Concurrency -and ($offset + $j) -lt $total; $j++) {
-            $batch += $Configs[$offset + $j]
-        }
-        if ($batch.Count -eq 0) { break }
+    $scanBase = Get-ScriptPort 'ScanPortBase' 20000
+    $queue = New-Object 'System.Collections.Generic.Queue[object]'
+    foreach ($c in $Configs) { $queue.Enqueue($c) }
+    $running = New-Object 'System.Collections.Generic.List[object]'
+    $freePorts = New-Object 'System.Collections.Generic.Queue[int]'
+    for ($p = 0; $p -lt $Concurrency; $p++) { $freePorts.Enqueue($scanBase + ($p * 10)) }
+    $results = [hashtable]::Synchronized(@{})
+    $realPings = [hashtable]::Synchronized(@{})
 
-        # Sobe N instancias de xray em runspaces paralelos (cada uma com porta propria)
-        $results = [hashtable]::Synchronized(@{})
-        $handles = @()
-        $powershells = @()
-        $runspaces = @()
-        for ($j = 0; $j -lt $batch.Count; $j++) {
-            $socks = 10808 + ($j * 10)
+    # Pipeline: slot livre pega o proximo servidor na hora. Esperar o lote inteiro
+    # deixava o scan refem do servidor mais lento (timeout de 10s por dead path).
+    while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+        while ($running.Count -lt $Concurrency -and $queue.Count -gt 0 -and ($MinStable -le 0 -or $stable.Count -lt $MinStable)) {
+            $cfg = $queue.Dequeue()
+            $socks = $freePorts.Dequeue()
             $http = $socks + 1
 
             $rs = [runspacefactory]::CreateRunspace()
             $rs.Open()
             $rs.SessionStateProxy.SetVariable('scanFuncSource', $funcSource)
-            $rs.SessionStateProxy.SetVariable('scanCfg', $batch[$j])
+            $rs.SessionStateProxy.SetVariable('scanCfg', $cfg)
             $rs.SessionStateProxy.SetVariable('scanSocks', $socks)
             $rs.SessionStateProxy.SetVariable('scanHttp', $http)
             $rs.SessionStateProxy.SetVariable('scanStab', $StabilitySeconds)
             $rs.SessionStateProxy.SetVariable('scanResults', $results)
-            $rs.SessionStateProxy.SetVariable('scanSlot', $j)
+            $rs.SessionStateProxy.SetVariable('scanReal', $realPings)
+            $rs.SessionStateProxy.SetVariable('scanSlot', $socks)
             $rs.SessionStateProxy.SetVariable('scanTempDir', $Script:TempDir)
             $rs.SessionStateProxy.SetVariable('scanV2RayExe', $Script:V2RayExe)
 
@@ -903,58 +1497,68 @@ $Script:V2RayExe = $scanV2RayExe
 Invoke-Expression $scanFuncSource
 function Write-Status { param([string]$Message, [string]$Type = 'INFO') }
 $scanResults[$scanSlot] = Test-ServerStable -Config $scanCfg -SocksPort $scanSocks -HttpPort $scanHttp -StabilitySeconds $scanStab
+$scanReal[$scanSlot] = $Script:LastRealPing
 '@)
-            $handles += $ps.BeginInvoke()
-            $powershells += $ps
-            $runspaces += $rs
-        }
-
-        # Espera todos do lote terminarem
-        $done = $false
-        while (-not $done) {
-            $done = $true
-            foreach ($h in $handles) {
-                if (-not $h.IsCompleted) { $done = $false; break }
+            $job = [pscustomobject]@{
+                Ps     = $ps
+                Rs     = $rs
+                Handle = $ps.BeginInvoke()
+                Cfg    = $cfg
+                Socks  = $socks
             }
-            if (-not $done) { Start-Sleep -Milliseconds 100 }
+            $running.Add($job)
         }
-        for ($j = 0; $j -lt $handles.Count; $j++) {
-            try { $powershells[$j].EndInvoke($handles[$j]) } catch { }
+
+        # Espera o primeiro terminar (qualquer um), coleta e libera o slot.
+        $fin = $null
+        while (-not $fin) {
+            foreach ($job in $running) {
+                if ($job.Handle.IsCompleted) { $fin = $job; break }
+            }
+            if (-not $fin) { Start-Sleep -Milliseconds 50 }
         }
-        foreach ($rs in $runspaces) { try { $rs.Dispose() } catch { } }
-        foreach ($ps in $powershells) { try { $ps.Dispose() } catch { } }
+        $running.Remove($fin) | Out-Null
+        try { $fin.Ps.EndInvoke($fin.Handle) } catch { }
+        try { $fin.Rs.Dispose() } catch { }
+        try { $fin.Ps.Dispose() } catch { }
+        $freePorts.Enqueue($fin.Socks)
 
-        # Coleta resultados na ordem do lote
-        for ($j = 0; $j -lt $batch.Count; $j++) {
-            $tested++
-            $cfg = $batch[$j]
-            if ($Sync) { $Sync.ScanTested = $tested; $Sync.Progress = [int](($tested / $total) * 100) }
+        $tested++
+        if ($Sync) { $Sync.ScanTested = $tested; $Sync.Progress = [int](($tested / $total) * 100) }
 
-            if ($results.ContainsKey($j) -and $results[$j]) {
-                $stable += $cfg
-                Write-Status "Estavel (TCP+UDP): $(Get-ShortName $cfg.Name)" "OK"
-                if ($MinStable -gt 0 -and $stable.Count -ge $MinStable) {
-                    Write-Status "Encerrando scan: $($stable.Count) servidores estaveis" "OK"
-                    break
-                }
+        if ($results.ContainsKey($fin.Socks) -and $results[$fin.Socks]) {
+            $real = 0
+            if ($realPings.ContainsKey($fin.Socks)) { $real = [int]$realPings[$fin.Socks] }
+            $fin.Cfg.RealPing = $real
+            $stable += $fin.Cfg
+            if ($real -gt 0 -and $real -lt 9999) {
+                Write-Status "Working (TCP+UDP, ${real}ms real): $(Get-ShortName $fin.Cfg.Name)" "OK"
             }
             else {
-                Write-Status "Descartado: $(Get-ShortName $cfg.Name)" "WARN"
+                Write-Status "Working (TCP+UDP): $(Get-ShortName $fin.Cfg.Name)" "OK"
             }
-
-            # ETA adaptativo: media real de tempo por servidor x servidores restantes
-            if ($Sync) {
-                $eta = Get-ScanEtaSeconds -ElapsedSeconds $scanSw.Elapsed.TotalSeconds -Total $total -Tested $tested
-                $newDeadline = [DateTime]::Now.AddSeconds($eta)
-                if ($Sync.ScanDeadline -eq [DateTime]::MinValue -or $newDeadline -lt $Sync.ScanDeadline) {
-                    $Sync.ScanDeadline = $newDeadline
-                }
+            if ($MinStable -gt 0 -and $stable.Count -ge $MinStable) {
+                Write-Status "Stopping scan: $($stable.Count) working servers" "OK"
             }
         }
+        else {
+            Write-Status "Discarded: $(Get-ShortName $fin.Cfg.Name)" "WARN"
+        }
 
-        $offset += $batch.Count
+        # ETA adaptativo: media real de tempo por servidor x servidores restantes
+        if ($Sync) {
+            $eta = Get-ScanEtaSeconds -ElapsedSeconds $scanSw.Elapsed.TotalSeconds -Total $total -Tested $tested
+            $newDeadline = [DateTime]::Now.AddSeconds($eta)
+            if ($Sync.ScanDeadline -eq [DateTime]::MinValue -or $newDeadline -lt $Sync.ScanDeadline) {
+                $Sync.ScanDeadline = $newDeadline
+            }
+        }
     }
     if ($Sync) { $Sync.Progress = 100; $Sync.ScanDeadline = [DateTime]::Now }
+
+    if ($stable.Count -gt 1) {
+        $stable = @($stable | Sort-Object -Property @{ Expression = { if ($_.RealPing -and $_.RealPing -gt 0) { [int]$_.RealPing } else { 9999 } } })
+    }
     return $stable
 }
 
@@ -1008,6 +1612,7 @@ function Get-CountryNamePt {
             'DO' = 'Republica Dominicana'; 'UY' = 'Uruguai'; 'PY' = 'Paraguai'; 'PE' = 'Peru';
             'VE' = 'Venezuela'; 'EC' = 'Equador'; 'BO' = 'Bolivia'; 'GT' = 'Guatemala';
             'CR' = 'Costa Rica'; 'PA' = 'Panama'; 'CU' = 'Cuba'; 'PR' = 'Porto Rico';
+            'AL' = 'Albania'; 'BA' = 'Bosnia'; 'MK' = 'Macedonia do Norte'; 'ME' = 'Montenegro'; 'XK' = 'Kosovo';
         }
     }
     $map = $Script:CountryMap
@@ -1053,21 +1658,66 @@ function Resolve-DnsParallel {
     return $result
 }
 
+function Initialize-GeoIpData {
+    # Le os bytes para a variavel de script SEM devolver pelo pipeline: um byte[]
+    # retornado por funcao e desenrolado em 3.6 milhoes de objetos e o
+    # [BitConverter] precisa reconverte-los a cada consulta (minutos de CPU).
+    if ($Script:GeoIpData) { return $true }
+
+    $file = $Script:GeoIpFile
+    if (-not $file -or -not (Test-Path $file)) { return $false }
+
+    try { $Script:GeoIpData = [System.IO.File]::ReadAllBytes($file) } catch { return $false }
+    # 10 bytes por registro: start(4) end(4) cc(2), little-endian. Gerado no build.
+    if ($Script:GeoIpData.Length -lt 10 -or ($Script:GeoIpData.Length % 10) -ne 0) {
+        $Script:GeoIpData = $null
+        return $false
+    }
+    return $true
+}
+
+function Get-CountryCodeOffline {
+    param([string]$Ip = "")
+
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($Ip, [ref]$parsed)) { return "" }
+    $b = $parsed.GetAddressBytes()
+    if ($b.Length -ne 4) { return "" }
+
+    if (-not (Initialize-GeoIpData)) { return "" }
+    $data = $Script:GeoIpData
+
+    $num = [System.BitConverter]::ToUInt32([byte[]]@($b[3], $b[2], $b[1], $b[0]), 0)
+    $count = [int]($data.Length / 10)
+    $lo = 0
+    $hi = $count - 1
+    while ($lo -le $hi) {
+        $mid = [int](($lo + $hi) / 2)
+        $off = $mid * 10
+        $start = [System.BitConverter]::ToUInt32($data, $off)
+        $end = [System.BitConverter]::ToUInt32($data, $off + 4)
+        if ($num -lt $start) { $hi = $mid - 1 }
+        elseif ($num -gt $end) { $lo = $mid + 1 }
+        else {
+            $cc = [System.Text.Encoding]::ASCII.GetString($data, $off + 8, 2)
+            if ($cc -eq 'ZZ') { return "" }
+            return $cc
+        }
+    }
+    return ""
+}
+
 function Resolve-Countries {
     param([array]$Configs)
 
     if (-not $Configs -or $Configs.Count -eq 0) { return }
 
-    # Garante a chave Country/CountryCode (strict mode), infere pelo nome e coleta hosts p/ DNS
+    # Garante chaves (strict mode). Nome do no e so fallback: mentira comum nas listas.
     $hosts = @{}
     foreach ($cfg in $Configs) {
         if (-not $cfg.ContainsKey('Country')) { $cfg['Country'] = '' }
         if (-not $cfg.ContainsKey('CountryCode')) { $cfg['CountryCode'] = '' }
-        $nameCode = Get-CountryCodeFromName -Name ([string]$cfg.Name)
-        if ($nameCode) {
-            $cfg['CountryCode'] = $nameCode
-            $cfg['Country'] = Get-CountryNamePt -Code $nameCode
-        }
+        $cfg['NameCode'] = Get-CountryCodeFromName -Name ([string]$cfg.Name)
         $srvHost = [string]$cfg.Host
         if ($srvHost) {
             $ip = $null
@@ -1080,17 +1730,19 @@ function Resolve-Countries {
     # DNS em paralelo (1 round-trip p/ todos os hosts, em vez de serial)
     $hostToIp = Resolve-DnsParallel -Hosts @($hosts.Keys)
 
-    # Cache em disco: IP -> codigo de pais
+    # Cache em disco: IP -> codigo de pais. Expira em 60 dias (IP muda de dono).
     $cachePath = Join-Path $Script:TempDir 'geo-cache.json'
     $cache = @{}
     if (Test-Path $cachePath) {
         try {
-            $raw = Get-Content $cachePath -Raw -ErrorAction Stop
-            if ($raw) {
-                $obj = $raw | ConvertFrom-Json -ErrorAction Stop
-                if ($obj) {
-                    foreach ($p in $obj.PSObject.Properties) {
-                        if ($p.Value) { $cache["$($p.Name)"] = "$($p.Value)" }
+            if (((Get-Date) - (Get-Item $cachePath).LastWriteTime).TotalDays -le 60) {
+                $raw = Get-Content $cachePath -Raw -ErrorAction Stop
+                if ($raw) {
+                    $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+                    if ($obj) {
+                        foreach ($p in $obj.PSObject.Properties) {
+                            if ($p.Value) { $cache["$($p.Name)"] = "$($p.Value)" }
+                        }
                     }
                 }
             }
@@ -1105,13 +1757,37 @@ function Resolve-Countries {
         $srvHost = [string]$cfg.Host
         if ([System.Net.IPAddress]::TryParse($srvHost, [ref]$ip)) { }
         elseif ($hostToIp.ContainsKey($srvHost)) { $ip = $hostToIp[$srvHost] }
-        if (-not $ip -or $cfg['Country'] -or (Test-CloudflareIp -IpString $ip)) { continue }
+        if (-not $ip) { continue }
+
+        # Nome primeiro: as listas livres rotulam o pais no nome, e o IP resolvido
+        # pode ser CDN/anycast e apontar para outro pais (ex.: "us US-1" -> Canada).
+        if ($cfg['NameCode']) {
+            $cfg['CountryCode'] = $cfg['NameCode']
+            $cfg['Country'] = Get-CountryNamePt -Code $cfg['NameCode']
+            continue
+        }
+
+        # Cloudflare esconde a origem: sem pais no nome, mostra CDN.
+        if (Test-CloudflareIp -IpString $ip) {
+            $cfg['Country'] = 'Cloudflare CDN'
+            continue
+        }
+
         if ($cache.ContainsKey($ip)) {
             $cfg['CountryCode'] = $cache[$ip]
             $cfg['Country'] = Get-CountryNamePt -Code $cache[$ip]
         }
         else {
-            [void]$missing.Add($ip)
+            # Base offline (DB-IP) primeiro: sem rede, sem rate limit.
+            $offline = Get-CountryCodeOffline -Ip $ip
+            if ($offline) {
+                $cache[$ip] = $offline
+                $cfg['CountryCode'] = $offline
+                $cfg['Country'] = Get-CountryNamePt -Code $offline
+            }
+            else {
+                [void]$missing.Add($ip)
+            }
         }
     }
 
@@ -1152,6 +1828,15 @@ function Resolve-Countries {
         $cfg['CountryCode'] = $cache[$ip]
         $cfg['Country'] = Get-CountryNamePt -Code $cache[$ip]
     }
+
+    # Fallback final: codigo do nome, e limpa a chave temporaria
+    foreach ($cfg in $Configs) {
+        if (-not $cfg['Country'] -and $cfg['NameCode']) {
+            $cfg['CountryCode'] = $cfg['NameCode']
+            $cfg['Country'] = Get-CountryNamePt -Code $cfg['NameCode']
+        }
+        $cfg.Remove('NameCode')
+    }
 }
 
 function Test-IsAdmin {
@@ -1160,46 +1845,141 @@ function Test-IsAdmin {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function New-SupervisorScript {
+    # Script que roda ELEVADO (via -EncodedCommand). Recebe tudo por ambiente.
+    return $Script:KillSwitchFuncs + "`n" + @'
+$ErrorActionPreference = 'Continue'
+$xray = $env:SETTVPN_XRAY
+$config = $env:SETTVPN_CFG
+$stopFile = $env:SETTVPN_STOP
+$readyFile = $env:SETTVPN_READY
+$parentPid = [int]$env:SETTVPN_PARENT
+$logPath = $env:SETTVPN_LOG
+
+function Write-KsLog([string]$Message) {
+    try { Add-Content -LiteralPath $logPath -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [KILLSWITCH] $Message" } catch { }
+}
+
+$p = Start-Process -FilePath $xray -ArgumentList "run -c `"$config`"" -PassThru -NoNewWindow
+try {
+    if ($env:SETTVPN_KS -eq '1') {
+        # Espera o app confirmar o tunel (ou desistir): bloquear antes da hora
+        # faz a conexao falhar sozinha.
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        while ([DateTime]::UtcNow -lt $deadline -and -not (Test-Path $stopFile) -and -not $p.HasExited) {
+            if (Test-Path $readyFile) { break }
+            if (-not (Get-Process -Id $parentPid -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Milliseconds 250
+        }
+        if ((Test-Path $readyFile) -and -not $p.HasExited) {
+            if (Enable-SettVpnKillSwitch) {
+                # Fail-open: se depois do bloqueio o tunel nao passar, restaura na hora.
+                $ok = $false
+                for ($i = 0; $i -lt 3 -and -not $ok; $i++) {
+                    try {
+                        $null = Invoke-WebRequest -Uri 'http://www.gstatic.com/generate_204' -Proxy "http://127.0.0.1:$($env:SETTVPN_HTTP)" -TimeoutSec 6 -UseBasicParsing -ErrorAction Stop
+                        $ok = $true
+                    }
+                    catch { Start-Sleep -Milliseconds 700 }
+                }
+                if ($ok) { Write-KsLog 'ativo (bloqueado tudo exceto xray, loopback e a interface TUN)' }
+                else {
+                    [void](Restore-SettVpnFirewall)
+                    Write-KsLog 'FALHOU: sem conectividade com as regras - firewall restaurado (fail-open)'
+                }
+            }
+            else { Write-KsLog 'FALHOU ao aplicar as regras - firewall restaurado (fail-open)' }
+        }
+    }
+
+    while (-not (Test-Path $stopFile) -and -not $p.HasExited) {
+        if (-not (Get-Process -Id $parentPid -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 300
+    }
+}
+finally {
+    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    # Sempre restaura: no auto-reconnect isso abre uma janela de poucos segundos
+    # sem bloqueio. Manter o bloqueio entre supervisores exigiria um estado
+    # "keep" (e um caminho de falha que deixasse o usuario offline para sempre).
+    [void](Restore-SettVpnFirewall)
+}
+'@
+}
+
 function Start-V2Ray {
     param([hashtable]$Config, [int]$StabilitySeconds = 3, [bool]$Tun = $false)
 
     $Script:LastFailReason = ""
+    $Script:ExitIp = ""
 
     # Stop existing process
     Stop-V2Ray
 
+    $stopFile = Join-Path $Script:TempDir "tun-stop.txt"
+    $readyFile = $Script:TunReadyFile
+    Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $readyFile -Force -ErrorAction SilentlyContinue
+
     # TUN no Windows exige o driver wintun.dll ao lado do v2ray.exe
     if ($Tun -and (-not $Script:WintunDll -or -not (Test-Path $Script:WintunDll))) {
-        $Script:LastFailReason = "wintun.dll ausente - modo TUN indisponivel"
+        $Script:LastFailReason = "wintun.dll missing - TUN mode unavailable"
         Write-Status $Script:LastFailReason "ERROR"
         return $false
     }
 
+    $ksRequested = [bool](Get-Variable -Name KillSwitch -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+    if ($ksRequested -and -not $Tun) { $ksRequested = $false }
+
     # Generate config
-    if (-not (Generate-V2RayConfig -Config $Config -Tun $Tun)) {
-        $Script:LastFailReason = "Falha ao gerar config do xray"
+    if (-not (Generate-V2RayConfig -Config $Config -Tun $Tun -ApiPort (Get-ScriptPort 'ApiPort' 10085))) {
+        $Script:LastFailReason = "Failed to generate xray config"
         return $false
     }
 
     # Start v2ray
     try {
         $Script:TunStopFile = $null
-        if ($Tun -and -not (Test-IsAdmin)) {
+        Remove-Item $Script:TunStateFile -Force -ErrorAction SilentlyContinue
+
+        if ($Tun) {
             # TUN exige admin (adaptador wintun). Sobe um supervisor elevado que
-            # gerencia o xray; o resto do app segue sem privilegios.
-            $supervisorScript = @'
-param($xray, $config, $stopFile)
-$p = Start-Process -FilePath $xray -ArgumentList "run -c `"$config`"" -PassThru -NoNewWindow
-while (-not (Test-Path $stopFile) -and -not $p.HasExited) { Start-Sleep -Milliseconds 300 }
-if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-'@
-            $stopFile = Join-Path $Script:TempDir "tun-stop.txt"
-            Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
-            $supervisorPath = Join-Path $Script:TempDir "tun-supervisor.ps1"
-            Set-Content -Path $supervisorPath -Value $supervisorScript -Encoding UTF8
-            $supervisor = Start-Process powershell -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$supervisorPath`" -xray `"$($Script:V2RayExe)`" -config `"$($Script:ConfigJson)`" -stopFile `"$stopFile`""
+            # gerencia o xray e o kill switch; o resto do app segue sem privilegios.
+            # Codigo vai por -EncodedCommand: nada de .ps1 gravavel pelo usuario rodando elevado.
+            # Parametros por variavel de ambiente: sem escaping de caminho.
+            $supervisorScript = New-SupervisorScript
+            $envNames = @('SETTVPN_XRAY', 'SETTVPN_CFG', 'SETTVPN_STOP', 'SETTVPN_READY', 'SETTVPN_PARENT', 'SETTVPN_LOG', 'SETTVPN_KS', 'SETTVPN_KS_BACKUP', 'SETTVPN_HTTP')
+            $env:SETTVPN_XRAY = $Script:V2RayExe
+            $env:SETTVPN_CFG = $Script:ConfigJson
+            $env:SETTVPN_STOP = $stopFile
+            $env:SETTVPN_READY = $readyFile
+            $env:SETTVPN_PARENT = [string]$PID
+            $env:SETTVPN_LOG = $Script:AppLog
+            $env:SETTVPN_KS = if ($ksRequested) { '1' } else { '0' }
+            $env:SETTVPN_KS_BACKUP = $Script:KillSwitchBackup
+            $env:SETTVPN_HTTP = [string]$Script:HttpPort
+            try {
+                $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($supervisorScript))
+                $spArgs = @{
+                    FilePath     = 'powershell'
+                    PassThru     = $true
+                    WindowStyle  = 'Hidden'
+                    ArgumentList = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+                }
+                # Executavel ja elevado (manifest requireAdministrator): RunAs pediria
+                # um segundo UAC sem motivo.
+                if (-not (Test-IsAdmin)) { $spArgs.Verb = 'RunAs' }
+                $supervisor = Start-Process @spArgs
+            }
+            finally {
+                foreach ($n in $envNames) { Remove-Item "Env:$n" -ErrorAction SilentlyContinue }
+            }
             $Script:V2RayProcess = $supervisor
             $Script:TunStopFile = $stopFile
+
+            # Marcador em disco: runspaces/processos futuros sabem que o xray pode estar elevado.
+            $state = @{ StopFile = $stopFile; Started = (Get-Date).ToString("o") }
+            [System.IO.File]::WriteAllText($Script:TunStateFile, ($state | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
         }
         else {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1207,8 +1987,8 @@ if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyCont
             $psi.Arguments = "run -c `"$Script:ConfigJson`""
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
+            # Sem redirect: pipe nao drenado enche e trava o xray. O log vai pro arquivo.
+
             $Script:V2RayProcess = [System.Diagnostics.Process]::Start($psi)
         }
         $Script:CurrentConfig = $Config
@@ -1243,11 +2023,13 @@ if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyCont
             if (-not $tunOk) {
                 $tail = Get-XrayLogTail
                 $reason = if ($tail) { "Log: $tail" } else { "driver wintun ausente?" }
-                $Script:LastFailReason = "TUN falhou - trafego vazando. $reason"
+                $Script:LastFailReason = "TUN failed - traffic leaking. $reason"
                 Write-Status $Script:LastFailReason "ERROR"
                 Stop-V2Ray
                 return $false
             }
+            # Tunel confirmado: o supervisor elevado pode aplicar o kill switch.
+            try { [System.IO.File]::WriteAllText($readyFile, (Get-Date).ToString("o")) } catch { }
         }
 
         # 2) Estabilidade: multiplas checagens ativas espacadas (janela de $StabilitySeconds s)
@@ -1261,7 +2043,7 @@ if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyCont
                 return $false
             }
             if (-not (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500)) {
-                $Script:LastFailReason = "Server instavel (caiu): $(Get-ShortName $Config.Name)$(Get-FailReason)"
+                $Script:LastFailReason = "Server unstable (dropped): $(Get-ShortName $Config.Name)$(Get-FailReason)"
                 Write-Status $Script:LastFailReason "WARN"
                 Stop-V2Ray
                 return $false
@@ -1269,18 +2051,24 @@ if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyCont
         }
 
         if ($Script:V2RayProcess -and -not $Script:V2RayProcess.HasExited) {
+            $socksPort = Get-ScriptPort 'SocksPort' 10808
+            $httpPort = Get-ScriptPort 'HttpPort' 10809
+
             Write-Status "Connected to VPN: $(Get-ShortName $Config.Name)" "OK"
             Write-Status "Protocol: $($Config.Protocol) | Server: $($Config.Host):$($Config.Port) | Ping: $($Config.Ping)ms" "INFO"
+
+            $Script:ExitIp = Get-ExitIp
+            if ($Script:ExitIp) { Write-Status "Exit IP: $($Script:ExitIp)" "INFO" }
+
             Write-Host ""
             Write-Host "  =============================================" -ForegroundColor Cyan
             Write-Host "   Configure o proxy no navegador (SwitchyOmega):" -ForegroundColor Yellow
             Write-Host "     Tipo      : SOCKS5" -ForegroundColor White
             Write-Host "     Server    : 127.0.0.1" -ForegroundColor White
-            Write-Host "     Porta     : 10808" -ForegroundColor White
-            Write-Host "     DNS remoto: ATIVADO (pra nao vazar DNS)" -ForegroundColor White
+            Write-Host "     Porta     : $socksPort" -ForegroundColor White
             Write-Host "  --------------------------------------------" -ForegroundColor Cyan
             Write-Host "   Apps sem suporte a SOCKS5 (ex: Discord):" -ForegroundColor Yellow
-            Write-Host "     Use o proxy HTTP 127.0.0.1:10809" -ForegroundColor White
+            Write-Host "     Use o proxy HTTP 127.0.0.1:$httpPort" -ForegroundColor White
             Write-Host "     ou ative 'Proxy do sistema' no menu" -ForegroundColor White
             Write-Host "  =============================================" -ForegroundColor Cyan
             Write-Host ""
@@ -1300,18 +2088,27 @@ if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyCont
 
 function Stop-V2Ray {
     $ownPid = 0
+    $stopFile = Join-Path $Script:TempDir "tun-stop.txt"
+    $tunWasActive = Test-Path $Script:TunStateFile
+    $ksWasActive = Test-KillSwitchActive
+
+    # xray elevado vive fora deste processo/runspace. O estado em disco e o sinal
+    # que o supervisor observa; sem isso "Desconectar" mente e a rota TUN fica.
+    if ($tunWasActive) {
+        try { New-Item -Path $stopFile -ItemType File -Force | Out-Null } catch { }
+    }
+    Remove-Item $Script:TunReadyFile -Force -ErrorAction SilentlyContinue
+
     if ($Script:V2RayProcess) {
         $ownPid = $Script:V2RayProcess.Id
         try {
             if (-not $Script:V2RayProcess.HasExited) {
-                if ($Script:TunStopFile) {
-                    # xray elevado via supervisor: sinaliza para o supervisor encerrar o xray e sair
-                    try { New-Item -Path $Script:TunStopFile -ItemType File -Force | Out-Null } catch { }
-                    [void]$Script:V2RayProcess.WaitForExit(5000)
-                }
-                else {
+                # O supervisor ainda restaura o firewall antes de sair: matar cedo
+                # deixaria a saida bloqueada.
+                if ($tunWasActive) { [void]$Script:V2RayProcess.WaitForExit(10000) }
+                if (-not $Script:V2RayProcess.HasExited) {
                     $Script:V2RayProcess.Kill()
-                    [void]$Script:V2RayProcess.WaitForExit(5000)
+                    [void]$Script:V2RayProcess.WaitForExit(3000)
                 }
             }
             $Script:V2RayProcess.Dispose()
@@ -1325,10 +2122,20 @@ function Stop-V2Ray {
         $Script:CurrentConfig = $null
     }
 
-    if ($Script:TunStopFile) {
-        try { Remove-Item $Script:TunStopFile -Force -ErrorAction SilentlyContinue } catch { }
+    if ($tunWasActive) {
+        # Espera a porta HTTP liberar: o xray elevado morre fora do nosso processo.
+        $httpPort = Get-ScriptPort 'HttpPort' 10809
+        for ($i = 0; $i -lt 20 -and (Test-LocalPort -Port $httpPort -TimeoutMs 200); $i++) {
+            Start-Sleep -Milliseconds 250
+        }
+        Remove-Item $Script:TunStateFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $stopFile -Force -ErrorAction SilentlyContinue
         $Script:TunStopFile = $null
+        $Script:ExitIp = ""
     }
+
+    # Supervisor morreu sem restaurar (ou app foi morto antes): UAC e a unica saida.
+    if ($ksWasActive -and (Test-KillSwitchActive)) { Restore-OrphanKillSwitch }
 
     # Mata apenas o NOSSO binario (PID rastreado ou caminho exato), nunca v2ray de terceiros.
     try {
@@ -1369,8 +2176,9 @@ function Test-V2RayTun {
     # Verifica se o adaptador TUN foi criado e se a rota padrao passa por ele.
     # Sem isso o app reportaria "conectado (TUN ON)" com trafego vazando direto.
     try {
+        # So adaptador wintun (do xray). WireGuard do usuario nao vale como prova.
         $adapter = Get-NetAdapter -ErrorAction Stop | Where-Object {
-            $_.InterfaceDescription -match 'Wintun|WireGuard' -or $_.Name -match 'Wintun'
+            $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'Wintun'
         } | Select-Object -First 1
         if (-not $adapter) { return $false }
 
@@ -1422,7 +2230,9 @@ function Get-FailReason {
 }
 
 function Test-V2RayTunnel {
-    param([int]$TimeoutMs = 2500, [int]$Attempts = 2, [int]$SocksPort = 10808)
+    param([int]$TimeoutMs = 2500, [int]$Attempts = 2, [int]$SocksPort = 0)
+
+    if ($SocksPort -le 0) { $SocksPort = Get-ScriptPort 'SocksPort' 10808 }
 
     # Multiplos alvos (porta 443, pouco bloqueada): dominio valida DNS + roteamento, IP valida roteamento
     $targets = @(
@@ -1531,7 +2341,9 @@ function Build-DnsQuery {
 }
 
 function Test-V2RayUdp {
-    param([int]$TimeoutMs = 2500, [int]$SocksPort = 10808)
+    param([int]$TimeoutMs = 2500, [int]$SocksPort = 0)
+
+    if ($SocksPort -le 0) { $SocksPort = Get-ScriptPort 'SocksPort' 10808 }
 
     # Valida UDP atraves do tunel via SOCKS5 UDP ASSOCIATE + DNS para 8.8.8.8:53
     $client = $null
@@ -1603,6 +2415,7 @@ function Test-V2RayUdp {
 $Script:ProxyActive = $false
 $Script:ProxyBackupEnable = $null
 $Script:ProxyBackupServer = $null
+$Script:ProxyBackupOverride = $null
 $Script:ProxyBackupFile = Join-Path $Script:TempDir "proxy-backup.json"
 
 if (-not ("SettVPN.WinInetNative" -as [type])) {
@@ -1616,12 +2429,15 @@ public class WinInetNative {
 }
 
 function Set-ProxyRegistry {
-    param([int]$Enable, [string]$Server = "")
+    param([int]$Enable, [string]$Server = "", [string]$Override)
 
     $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
     Set-ItemProperty -Path $path -Name ProxyEnable -Value $Enable
     if ($Server) {
         Set-ItemProperty -Path $path -Name ProxyServer -Value $Server
+    }
+    if ($PSBoundParameters.ContainsKey('Override')) {
+        Set-ItemProperty -Path $path -Name ProxyOverride -Value $Override
     }
 
     try {
@@ -1632,9 +2448,9 @@ function Set-ProxyRegistry {
 }
 
 function Save-ProxyBackup {
-    param([int]$Enable, [string]$Server)
+    param([int]$Enable, [string]$Server, [string]$Override)
     try {
-        $obj = @{ Enable = $Enable; Server = [string]$Server }
+        $obj = @{ Enable = $Enable; Server = [string]$Server; Override = [string]$Override }
         [System.IO.File]::WriteAllText($Script:ProxyBackupFile, ($obj | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
     }
     catch { }
@@ -1651,33 +2467,87 @@ function Restore-OrphanProxy {
     try {
         $obj = Get-Content $Script:ProxyBackupFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         if ($obj) {
-            Set-ProxyRegistry -Enable ([int]$obj.Enable) -Server ([string]$obj.Server)
-            Write-Status "Proxy do sistema restaurado (execucao anterior caiu com proxy ativo)" "WARN"
+            $enable = 0
+            if ($null -ne (Get-PropOr $obj 'Enable')) { $enable = [int](Get-PropOr $obj 'Enable') }
+            Set-ProxyRegistry -Enable $enable -Server ([string](Get-PropOr $obj 'Server' '')) -Override ([string](Get-PropOr $obj 'Override' ''))
+            Write-Status "System proxy restored (previous run crashed with proxy active)" "WARN"
         }
     }
     catch { }
     Clear-ProxyBackup
 }
 
+function New-ProxyOverride {
+    param([string]$Current)
+
+    # Nao perder bypass corporativo; garante que localhost nunca volte pro proxy
+    # (loop: navegador -> proxy local -> proxy local).
+    $parts = @()
+    if ($Current) { $parts = @($Current -split ';' | Where-Object { $_ }) }
+    foreach ($need in @('<local>', '127.*', 'localhost')) {
+        if ($parts -notcontains $need) { $parts += $need }
+    }
+    return ($parts -join ';')
+}
+
 function Enable-SystemProxy {
-    if (-not $Script:ProxyActive) {
-        $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    $httpPort = Get-ScriptPort 'HttpPort' 10809
+
+    # Proxy apontando p/ porta morta derruba a navegacao do usuario inteira.
+    if (-not (Test-LocalPort -Port $httpPort)) {
+        Write-Status "System proxy not enabled: nothing listening on 127.0.0.1:$httpPort (connect first)" "WARN"
+        return $false
+    }
+
+    $path = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    # Backup so na primeira vez: nao sobrescrever o original com o nosso proprio valor.
+    if (-not (Test-Path $Script:ProxyBackupFile)) {
         $Script:ProxyBackupEnable = (Get-ItemProperty -Path $path -Name ProxyEnable -ErrorAction SilentlyContinue).ProxyEnable
         $Script:ProxyBackupServer = (Get-ItemProperty -Path $path -Name ProxyServer -ErrorAction SilentlyContinue).ProxyServer
-        Save-ProxyBackup -Enable ([int]$Script:ProxyBackupEnable) -Server ([string]$Script:ProxyBackupServer)
+        $Script:ProxyBackupOverride = (Get-ItemProperty -Path $path -Name ProxyOverride -ErrorAction SilentlyContinue).ProxyOverride
+        Save-ProxyBackup -Enable ([int]$Script:ProxyBackupEnable) -Server ([string]$Script:ProxyBackupServer) -Override ([string]$Script:ProxyBackupOverride)
     }
-    Set-ProxyRegistry -Enable 1 -Server "http=127.0.0.1:10809;https=127.0.0.1:10809;socks=127.0.0.1:10808"
+
+    # Sem entrada socks=: WinINET ignora e apps que leem o registro pegam lixo.
+    Set-ProxyRegistry -Enable 1 -Server "http=127.0.0.1:$httpPort;https=127.0.0.1:$httpPort" -Override (New-ProxyOverride -Current ([string]$Script:ProxyBackupOverride))
     $Script:ProxyActive = $true
-    Write-Status "System proxy enabled: http=127.0.0.1:10809 / socks=127.0.0.1:10808" "OK"
+    Write-Status "System proxy enabled: http/https 127.0.0.1:$httpPort" "OK"
+    return $true
 }
 
 function Disable-SystemProxy {
-    if ($null -ne $Script:ProxyBackupEnable) {
-        Set-ProxyRegistry -Enable $Script:ProxyBackupEnable -Server ([string]$Script:ProxyBackupServer)
+    # $Script:ProxyActive nao sobrevive a troca de runspace; o backup em disco sim.
+    if (-not (Test-Path $Script:ProxyBackupFile) -and -not $Script:ProxyActive -and $null -eq $Script:ProxyBackupEnable) {
+        Write-Status "System proxy is not under SettVPN control - nothing to restore" "INFO"
+        return
+    }
+
+    $enable = $Script:ProxyBackupEnable
+    $server = $Script:ProxyBackupServer
+    $override = $Script:ProxyBackupOverride
+
+    if (Test-Path $Script:ProxyBackupFile) {
+        try {
+            $obj = Get-Content $Script:ProxyBackupFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($obj) {
+                $bEnable = Get-PropOr $obj 'Enable'
+                $bServer = Get-PropOr $obj 'Server'
+                $bOverride = Get-PropOr $obj 'Override'
+                if ($null -ne $bEnable) { $enable = [int]$bEnable }
+                if ($null -ne $bServer) { $server = [string]$bServer }
+                if ($null -ne $bOverride) { $override = [string]$bOverride }
+            }
+        }
+        catch { }
+    }
+
+    if ($null -ne $enable) {
+        Set-ProxyRegistry -Enable ([int]$enable) -Server ([string]$server) -Override ([string]$override)
     }
     else {
         Set-ProxyRegistry -Enable 0
     }
+
     Clear-ProxyBackup
     $Script:ProxyActive = $false
     Write-Status "System proxy disabled" "OK"

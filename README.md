@@ -2,143 +2,85 @@
 
 # ⚡ SETT VPN
 
-**Free VPN client for Windows** — auto-fetches free server configs, connects via embedded **Xray-core**, and exposes **SOCKS5 + HTTP proxy** plus a full **TUN** mode. Dark minimalist UI, no installation required.
+**Free VPN client for Windows.** Fetches public server configs, tests them, and tunnels your traffic through the embedded Xray-core — system proxy or full TUN mode. Single self-contained `.exe`, no installation.
 
 [![Platform](https://img.shields.io/badge/platform-Windows-1f6feb.svg?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-GPL--3.0-3fb950.svg?style=flat-square)](LICENSE)
-[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-8b949e.svg?style=flat-square)]()
 
 </div>
 
 ---
 
-## ✨ Features
+## Quick start
 
-- **⚡ One-click connect** — connects to the fastest *tested* server
-- **🔄 Auto-updating servers** — pulls fresh configs from free sources on every run
-- **🧪 Stability filter** — tests TCP **and** UDP, keeps only servers that actually work
-- **🌍 Country labels** — shows each server's country next to its name
-- **🔁 Auto-reconnect** — reconnects automatically if the tunnel drops
-- **📦 Self-contained** — Xray-core + wintun embedded, no installation required
-- **🖥️ Dark UI** — minimalist WPF interface with custom title bar and lightning icon
-- **🛡️ System proxy toggle** — HTTP + SOCKS5 system-wide in one click
-- **🌐 TUN mode** — routes the *entire* system through the VPN (Discord voice/WebRTC included)
-- **🧰 Crash-safe** — restores the system proxy if the app closes unexpectedly; single-instance
+1. Download `SettVPN.exe` from [Releases](../../releases).
+2. Run it. Windows asks for admin — the app always runs elevated (firewall + TUN adapter).
+3. Click **REFRESH** (~45 s): downloads the list, tests TCP + UDP and keeps only servers that actually carry traffic.
+4. Click **CONNECT**. The Windows proxy is enabled automatically, so your browser IP changes immediately.
 
----
+> Unsigned binary: Windows may show _"Unknown publisher"_ → **More info → Run anyway**.
 
-## 🚀 Quick Start
+## Features
 
-1. Download `SettVPN.exe`
-2. Double-click it — it runs as a **normal user** (no admin at launch)
-3. Click **ATUALIZAR** (fast list of reachable servers) then **FILTRAR** (keeps only stable TCP+UDP servers)
-4. Click **CONECTAR (MENOR PING)**
-5. To route the whole system (Discord voice, games), enable **TUN** — Windows asks for **admin** at that moment only
+|                       |                                                                                  |
+| :-------------------- | :------------------------------------------------------------------------------- |
+| **One-click connect** | picks the fastest server that passed the stability test                          |
+| **Real latency**      | measured through the tunnel (HTTP 204), not a TCP handshake to the server        |
+| **Live list only**    | dead servers never make it to the list                                           |
+| **Auto-reconnect**    | reconnects when the tunnel drops; restores proxy and firewall on exit            |
+| **System proxy**      | ON/OFF automatically around the connection, previous settings saved and restored |
+| **TUN mode**          | routes everything (Discord voice, games) through a Wintun adapter                |
+| **Kill switch**       | firewall blocks all outbound except the tunnel — TUN mode                        |
+| **Split tunneling**   | domains and IPs/CIDRs that bypass the VPN — TUN mode                             |
+| **Traffic stats**     | live upload/download counters from Xray's stats API                              |
+| **Offline GeoIP**     | country labels from an embedded DB-IP database                                   |
 
-> ⚠️ **First run:** Windows may show _"Unknown publisher"_ (unsigned binary). Click **More info → Run anyway** and **Yes**.
+## Proxy vs TUN
 
-## 🎛️ Buttons
+|                                   | System proxy                                                 | TUN mode               |
+| :-------------------------------- | :----------------------------------------------------------- | :--------------------- |
+| **Covers**                        | apps that respect the Windows proxy (browsers, Discord text) | everything — TCP + UDP |
+| **Discord voice**                 | ❌                                                           | ✅                     |
+| **Kill switch / split tunneling** | ❌                                                           | ✅                     |
+| **Ports**                         | HTTP `10809`, SOCKS5 `10808`                                 | virtual adapter        |
 
-| Button | What it does |
-| :----- | :----------- |
-| **CONECTAR (MENOR PING)** | connects to the fastest server in the current list |
-| **ATUALIZAR** | fetch + ping all servers (fast — no stability test) |
-| **FILTRAR** | runs the stability test (TCP + UDP), keeps only working servers |
-| **DESCONECTAR** | disconnects and turns off proxy / TUN |
-| **CONECTAR NO SELECIONADO** | connects to the server highlighted in the list |
+They are mutually exclusive. Enabling TUN disables the system proxy; SOCKS5 stays available at `127.0.0.1:10808` for apps configured manually.
 
-## 🌐 Proxy vs TUN
+## Supported protocols
 
-| | Proxy do sistema | Modo TUN |
-| :--- | :--- | :--- |
-| **Covers** | apps that respect the system proxy (browser, Discord text/API) | **everything** — TCP + UDP, all apps |
-| **Discord voice** | ❌ (WebRTC/UDP bypasses the proxy) | ✅ |
-| **Requires admin** | ❌ | ✅ |
-| **Ports** | HTTP `10809` · SOCKS5 `10808` | system-wide virtual adapter |
-
-Both are mutually exclusive — enabling one disables the other.
-
-## 🌐 Browser Setup (proxy mode)
-
-If you prefer the proxy over TUN, SETT VPN exposes a **SOCKS5** proxy at `127.0.0.1:10808`.
-
-| Setting    | Value                          |
-| :--------- | :----------------------------- |
-| Type       | SOCKS5                         |
-| Server     | `127.0.0.1`                    |
-| Port       | `10808`                        |
-| Remote DNS | **Enabled** (avoids DNS leaks) |
-
-Recommended: [SwitchyOmega](https://chrome.google.com/webstore/detail/proxy-switchyomega/padekgcemlokbadohgkifijomclgjgif) (Chrome/Edge).
-
----
-
-## 🌐 Supported Protocols
-
-| Protocol    | Transports                    |
-| :---------- | :---------------------------- |
+| Protocol    | Transports                     |
+| :---------- | :----------------------------- |
 | VLESS       | tcp, ws · none / tls / reality |
-| Shadowsocks | tcp                           |
-| Trojan      | tcp, ws · tls                 |
-| VMess       | tcp                           |
+| Trojan      | tcp, ws · tls                  |
+| VMess       | tcp, ws · none / tls           |
+| Shadowsocks | tcp (SIP002 and legacy links)  |
 
-> `grpc` / `xhttp` transports are filtered out (unsupported / unstable).
+`grpc` and `xhttp` transports are filtered out (unsupported/unstable).
 
----
+## Requirements
 
-## ⚙️ How It Works
+- Windows 10/11, 64-bit
+- Administrator (UAC) — TUN, kill switch and firewall restore need it
+- Windows PowerShell 5.1 (already part of Windows)
 
-1. Downloads configs from free public sources (see [Server Sources](#-server-sources))
-2. Parses `vless://`, `ss://`, `trojan://`, `vmess://` links
-3. Pings each server over TCP and sorts by latency
-4. **FILTRAR** launches the embedded core and verifies each server end-to-end (TCP + UDP over a real TLS handshake)
-5. Generates an Xray outbound config and connects — listening on SOCKS5 `127.0.0.1:10808` and HTTP `127.0.0.1:10809` (plus a TUN adapter when enabled)
+## How it works
 
-The `.exe` is **fully self-contained** — the PowerShell scripts under `Core\`, Xray-core and `wintun.dll` are compiled into it and extracted to `%TEMP%\SettVPN` on first run. Nothing else needs to be downloaded. The source under `Core\` is exactly what gets embedded, so the app stays fully auditable.
+1. Downloads config links from public free-server lists.
+2. Parses `vless://`, `trojan://`, `vmess://`, `ss://`.
+3. Pings all servers (TCP), then **tests an evenly spread sample end-to-end**: real core instance, tunnel check, TCP + UDP, HTTP request for latency.
+4. Connects with the embedded Xray-core and exposes SOCKS5 `127.0.0.1:10808` + HTTP `127.0.0.1:10809` (auto-shifted if busy), plus a TUN adapter when enabled.
+5. Health-checks the tunnel every 15 s and reconnects to the next best server on failure.
 
-> Xray-core and `wintun.dll` are **not committed** to the repo. `build.ps1` downloads them from the official [XTLS/Xray-core](https://github.com/XTLS/Xray-core) release at build time, keeping the repository small.
+Log: `%TEMP%\SettVPN\settvpn.log`. Config and GeoIP data are also extracted to `%TEMP%\SettVPN` on first run.
 
----
+## Notes
 
-## 📁 Project Structure
+- **Free servers are unreliable.** Lists change constantly; that is why the app tests before showing and reconnects automatically.
+- **Use at your own risk.** Public lists may include servers from unknown operators. Do not send sensitive data through them.
+- **Antivirus warnings** may appear: the launcher hosts PowerShell in-process and embeds Xray. The source is fully auditable in this repository.
+- **Server sources:** [abc-configs](https://github.com/FreeFolksOn/abc-configs-free-vpn-proxy-list), [Pawdroid Free-servers](https://github.com/Pawdroid/Free-servers), [peasoft NoMoreWalls](https://github.com/peasoft/NoMoreWalls).
+- **GeoIP:** DB-IP Lite, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) © [DB-IP](https://db-ip.com).
 
-```
-SettVPN.exe            self-contained app (scripts + Xray + wintun embedded)
-build.ps1              rebuild the exe + generate the icon
-Core\
-  SettVPN_Full.ps1     core logic (parsing, Xray process, ping, TUN) — embedded at build
-  SettVPN_Gui.ps1      WPF interface — embedded at build
-  settvpn.ico          window icon — embedded at build
-Build\
-  launcher.cs          exe launcher source (embeds Core\, extracts to temp at runtime)
-  app.manifest         UAC manifest (requireAdministrator)
-  icon.ico             lightning icon (generated by build.ps1)
-Tests\
-  unit-tests.ps1       offline unit tests (parse, country, countdown, TUN config)
-  integration-tests.ps1 end-to-end test (download → ping → stability → connect)
-```
-
----
-
-## 🧩 Server Sources
-
-Configs are fetched from free public lists:
-
-- [abc-configs](https://github.com/FreeFolksOn/abc-configs-free-vpn-proxy-list)
-- [Pawdroid Free-servers](https://github.com/Pawdroid/Free-servers)
-
-Embedded core: [XTLS/Xray-core](https://github.com/XTLS/Xray-core) (v26.3.27, bundled with `wintun.dll`), downloaded by `build.ps1` at build time.
-
----
-
-## ⚠️ Important
-
-- **Free servers are unreliable.** Configs change or go offline frequently — that's why **FILTRAR** exists and why the app auto-reconnects. Expect occasional failures.
-- **Use at your own risk.** Public config lists may contain servers operated by unknown third parties. Don't send sensitive data through untrusted nodes.
-- **Antivirus false positive?** The launcher hosts PowerShell in-process (via `System.Management.Automation`) and embeds Xray — some AVs flag this. The code is 100% open source — see the scripts under `Core\`.
-
----
-
-## 📄 License
+## License
 
 GPL-3.0. See [LICENSE](LICENSE).

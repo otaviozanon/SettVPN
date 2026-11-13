@@ -10,6 +10,7 @@ class SettVPNLauncher
     static string TempDir = Path.Combine(Path.GetTempPath(), "SettVPN");
     static string AppDir = Path.Combine(TempDir, "app");
     static Mutex InstanceMutex;
+    static EventWaitHandle ActivateEvent;
 
     static string[] ScriptResources = new[]
     {
@@ -20,6 +21,7 @@ class SettVPNLauncher
 
     static string V2RayResource = "v2ray.exe";
     static string WintunResource = "wintun.dll";
+    static string GeoIpResource = "geoip.bin";
 
     static Stream GetResourceStream(string suffix)
     {
@@ -41,22 +43,48 @@ class SettVPNLauncher
             return false;
         }
 
-        if (File.Exists(dest))
-        {
-            FileInfo fi = new FileInfo(dest);
-            if (fi.Length == src.Length)
-            {
-                return true;
-            }
-        }
-
         try
         {
-            using (FileStream fs = new FileStream(dest, FileMode.Create, FileAccess.Write))
+            // O binario extraido roda elevado no modo TUN: um arquivo trocado em
+            // repouso no %TEMP% nao pode passar. Hash, nao tamanho.
+            using (MemoryStream buffered = new MemoryStream())
             {
-                src.CopyTo(fs);
+                src.CopyTo(buffered);
+                buffered.Position = 0;
+
+                string expected;
+                using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    expected = Convert.ToBase64String(sha.ComputeHash(buffered));
+                }
+                buffered.Position = 0;
+
+                if (File.Exists(dest))
+                {
+                    string actual = null;
+                    try
+                    {
+                        using (FileStream fs = new FileStream(dest, FileMode.Open, FileAccess.Read, FileShare.Read))
+                        using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create())
+                        {
+                            actual = Convert.ToBase64String(sha.ComputeHash(fs));
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    if (actual == expected)
+                    {
+                        return true;
+                    }
+                }
+
+                using (FileStream fs = new FileStream(dest, FileMode.Create, FileAccess.Write))
+                {
+                    buffered.CopyTo(fs);
+                }
+                return true;
             }
-            return true;
         }
         catch
         {
@@ -71,7 +99,26 @@ class SettVPNLauncher
         InstanceMutex = new Mutex(true, "SettVPN_SingleInstance_Mutex", out createdNew);
         if (!createdNew)
         {
+            // Segunda instancia: so avisa a primeira para trazer a janela de volta.
+            try
+            {
+                using (EventWaitHandle ev = EventWaitHandle.OpenExisting("SettVPN_Activate"))
+                {
+                    ev.Set();
+                }
+            }
+            catch
+            {
+            }
             return;
+        }
+
+        try
+        {
+            ActivateEvent = new EventWaitHandle(false, EventResetMode.AutoReset, "SettVPN_Activate");
+        }
+        catch
+        {
         }
 
         try
@@ -105,6 +152,14 @@ class SettVPNLauncher
         using (Stream wintun = GetResourceStream(WintunResource))
         {
             if (!ExtractTo(wintun, Path.Combine(TempDir, "wintun.dll")))
+            {
+                return;
+            }
+        }
+
+        using (Stream geoip = GetResourceStream(GeoIpResource))
+        {
+            if (!ExtractTo(geoip, Path.Combine(TempDir, "geoip.bin")))
             {
                 return;
             }
