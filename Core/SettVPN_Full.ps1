@@ -1,4 +1,4 @@
-# SettVPN - Automated VPN Connection Manager
+﻿# SettVPN - Automated VPN Connection Manager
 # Uses abc-configs free VPN servers with embedded v2ray-core
 
 param([switch]$Console)
@@ -41,6 +41,8 @@ $Script:FuncSource = $null
 $Script:AbcConfigsUrl = "https://raw.githubusercontent.com/FreeFolksOn/abc-configs-free-vpn-proxy-list/main/README.md"
 $Script:SubConfigsUrl = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
 $Script:Sub2ConfigsUrl = "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt"
+$Script:SettingsFile = Join-Path $env:APPDATA "SettVPN\settings.json"
+$Script:Language = 'en'
 
 # Codigo do kill switch. Roda SOMENTE no supervisor elevado (e no restaurador avulso):
 # fica em string para ser injetado por -EncodedCommand, nunca como .ps1 gravavel.
@@ -201,7 +203,7 @@ function Restore-OrphanTun {
     catch { }
     Remove-Item $Script:TunStateFile -Force -ErrorAction SilentlyContinue
     Remove-Item $Script:TunReadyFile -Force -ErrorAction SilentlyContinue
-    Write-Status "Previous TUN session stopped" "WARN"
+    Write-Status (T 'Previous TUN session stopped') "WARN"
 }
 
 function Test-KillSwitchActive {
@@ -220,24 +222,24 @@ function Restore-OrphanKillSwitch {
             & ([scriptblock]::Create($code)) | Out-Null
         }
         else {
-            Write-Status "Restoring firewall (kill switch) from the previous run..." "WARN"
+            Write-Status (T 'Restoring firewall (kill switch) from the previous run...') "WARN"
             $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($code))
             $p = Start-Process powershell -Verb RunAs -PassThru -WindowStyle Hidden -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
             [void]$p.WaitForExit(20000)
         }
     }
     catch {
-        Write-Status "FAILED to restore the firewall: accept UAC or restore the outbound profile in Windows Defender Firewall" "ERROR"
+        Write-Status (T 'FAILED to restore the firewall: accept UAC or restore the outbound profile in Windows Defender Firewall') "ERROR"
     }
     finally {
         Remove-Item Env:\SETTVPN_KS_BACKUP -ErrorAction SilentlyContinue
     }
 
     if (Test-Path $Script:KillSwitchBackup) {
-        Write-Status "Firewall STILL blocking (kill switch) - restore the outbound profile manually" "ERROR"
+        Write-Status (T 'Firewall STILL blocking (kill switch) - restore the outbound profile manually') "ERROR"
     }
     else {
-        Write-Status "Firewall restored" "OK"
+        Write-Status (T 'Firewall restored') "OK"
     }
 }
 
@@ -328,6 +330,285 @@ function Get-PropOr {
     if ($p -and $null -ne $p.Value) { return $p.Value }
     return $Default
 }
+
+function Get-AppSettings {
+    # Preferencias ficam em %APPDATA% (o %TEMP% pode ser limpo pelo Windows).
+    $s = @{ StartMinimized = $false; StartWithWindows = $false; Language = 'en' }
+    try {
+        if (Test-Path -LiteralPath $Script:SettingsFile) {
+            $raw = [System.IO.File]::ReadAllText($Script:SettingsFile, (New-Object System.Text.UTF8Encoding($false)))
+            if ($raw) {
+                $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $obj) {
+                    $min = Get-PropOr $obj 'StartMinimized'
+                    $win = Get-PropOr $obj 'StartWithWindows'
+                    $lang = Get-PropOr $obj 'Language'
+                    if ($null -ne $min) { $s.StartMinimized = [bool]$min }
+                    if ($null -ne $win) { $s.StartWithWindows = [bool]$win }
+                    if ($lang -eq 'en' -or $lang -eq 'pt') { $s.Language = [string]$lang }
+                }
+            }
+        }
+    }
+    catch { }
+    return $s
+}
+
+function Save-AppSettings {
+    param([hashtable]$Settings)
+
+    try {
+        $dir = Split-Path -Parent $Script:SettingsFile
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $json = @{
+            StartMinimized   = [bool]$Settings.StartMinimized
+            StartWithWindows = [bool]$Settings.StartWithWindows
+            Language         = [string]$Settings.Language
+        } | ConvertTo-Json
+        [System.IO.File]::WriteAllText($Script:SettingsFile, $json, (New-Object System.Text.UTF8Encoding($false)))
+        return $true
+    }
+    catch { return $false }
+}
+
+function Get-AutoStartCommand {
+    # Precisa ser o exe (e nao o script): o caminho vem do launcher.
+    $exe = $env:SETTVPN_EXE
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) {
+        try { $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName } catch { $exe = '' }
+    }
+    if (-not $exe) { return '' }
+    return '"' + $exe + '"'
+}
+
+function Set-AutoStart {
+    param([bool]$Enabled, [string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')
+
+    if (-not $Enabled) {
+        Remove-ItemProperty -Path $RunKey -Name 'SettVPN' -ErrorAction SilentlyContinue
+        return $true
+    }
+    $cmd = Get-AutoStartCommand
+    if (-not $cmd) { return $false }
+    if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
+    Set-ItemProperty -Path $RunKey -Name 'SettVPN' -Value $cmd
+    return $true
+}
+
+function Test-AutoStart {
+    param([string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')
+    return $null -ne (Get-ItemProperty -Path $RunKey -Name 'SettVPN' -ErrorAction SilentlyContinue)
+}
+
+function T {
+    param([string]$Text)
+
+    # Chave = texto em ingles. Sem traducao cadastrada, devolve o original.
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $lang = 'en'
+    if (Get-Variable -Name 'Language' -Scope Script -ErrorAction SilentlyContinue) { $lang = $Script:Language }
+    if ($lang -ne 'pt') {
+        # Volta ao ingles: traduz o que ja esta em PT (troca de idioma ao vivo).
+        if (-not (Get-Variable -Name 'UiStringsEn' -Scope Script -ErrorAction SilentlyContinue)) {
+            $Script:UiStringsEn = @{}
+            $pt = Get-UiStringsPt
+            foreach ($k in $pt.Keys) {
+                if ($k -like '*:*') { continue }
+                $v = [string]$pt[$k]
+                if ($v -and -not $Script:UiStringsEn.ContainsKey($v)) { $Script:UiStringsEn[$v] = $k }
+            }
+        }
+        if ($Script:UiStringsEn.ContainsKey($Text)) { return $Script:UiStringsEn[$Text] }
+        return $Text
+    }
+    if (-not (Get-Variable -Name 'UiStringsPt' -Scope Script -ErrorAction SilentlyContinue)) {
+        $Script:UiStringsPt = Get-UiStringsPt
+    }
+    if ($Script:UiStringsPt.ContainsKey($Text)) { return $Script:UiStringsPt[$Text] }
+    return $Text
+}
+
+function Get-CountryLabel {
+    param($Config)
+
+    # Nome do pais no idioma atual; cai no texto ja resolvido (ex.: "Cloudflare CDN").
+    $code = [string]$Config['CountryCode']
+    if ($code) {
+        $name = Get-CountryNamePt -Code $code
+        if ($name -and $name -ne $code) { return $name }
+    }
+    return [string]$Config['Country']
+}
+
+function Get-UiStringsPt {
+    # Chave = texto em ingles. Usado por T; cobre GUI, logs, status e dialogos.
+    return @{
+        'CONNECT' = 'CONECTAR'
+        'REFRESH' = 'ATUALIZAR'
+        'DISCONNECT' = 'DESCONECTAR'
+        'CONNECT SELECTED' = 'CONECTAR SELECIONADO'
+        'CONNECTED' = 'CONECTADO'
+        'DISCONNECTED' = 'DESCONECTADO'
+        'Not connected' = 'Sem conexão'
+        'Connect to hide your IP' = 'Conecte para ocultar seu IP'
+        'Ready' = 'Pronto'
+        'ACTIVITY' = 'ATIVIDADE'
+        'PROGRESS' = 'PROGRESSO'
+        'Copy activity' = 'Copiar atividade'
+        'Search country or name' = 'Buscar país ou nome'
+        'All' = 'Todos'
+        'Filter by country' = 'Filtrar por país'
+        'Show only servers from this country' = 'Mostrar só servidores deste país'
+        'Sort by latency' = 'Ordenar por latência'
+        'Fetch the list, test TCP+UDP and keep only working servers (~1 min)' = 'Baixa a lista, testa TCP+UDP e mantém só os servidores que funcionam (~1 min)'
+        'Settings' = 'Configurações'
+        'Proxy, TUN, kill switch and split tunneling' = 'Proxy, TUN, kill switch e split tunneling'
+        'System proxy' = 'Proxy do sistema'
+        'TUN mode (all traffic)' = 'Modo TUN (todo o tráfego)'
+        'Routes Discord/voice and everything else' = 'Roteia Discord/voz e todo o resto'
+        'blocks everything outside the tunnel' = 'bloqueia tudo fora do túnel'
+        'no rules' = 'sem regras'
+        'EDIT' = 'EDITAR'
+        'Details' = 'Detalhes'
+        'Kill switch and split tunneling only work in TUN mode.' = 'Kill switch e split tunneling só funcionam no modo TUN.'
+        'Start minimized' = 'Iniciar minimizado'
+        'Open straight to the tray' = 'Abre direto na bandeja'
+        'Start with Windows' = 'Iniciar com o Windows'
+        'Launch at login (asks for admin)' = 'Abre no login (pede admin)'
+        'Language' = 'Idioma'
+        'Interface language' = 'Idioma da interface'
+        'Save' = 'Salvar'
+        'Cancel' = 'Cancelar'
+        'Kill switch' = 'Kill switch'
+        'TUN mode' = 'Modo TUN'
+        'menu:Open' = 'Abrir'
+        'menu:Connect' = 'Conectar'
+        'menu:Disconnect' = 'Desconectar'
+        'menu:TUN' = 'Modo TUN (liga/desliga)'
+        'menu:Exit' = 'Sair'
+        'Could not register the startup entry' = 'Não foi possível registrar a inicialização'
+        'One rule per line. Domains (netflix.com) and IPs/CIDRs (10.0.0.0/8) go DIRECT, outside the VPN. TUN mode only. Lines starting with # are ignored.' = 'Uma regra por linha. Domínios (netflix.com) e IPs/CIDRs (10.0.0.0/8) saem DIRETO, fora da VPN. Só no modo TUN. Linhas com # são ignoradas.'
+
+        "Kill switch`n`nBlocks ALL Windows outbound traffic (firewall profiles) except xray, the local proxy and the tunnel interface. If the VPN drops, nothing leaks to the internet.`n`nTUN mode only. Requires admin (UAC). On disconnect the firewall is restored; if the app is killed, the next start restores it (UAC)." = "Kill switch`n`nBloqueia TODA a saída do Windows (perfis de firewall) exceto o xray, o proxy local e a interface do túnel. Se a VPN cair, nada vaza para a internet.`n`nSó no modo TUN. Exige admin (UAC). Ao desconectar o firewall é restaurado; se o app for morto, o próximo start restaura (UAC)."
+        "Split tunneling`n`nListed domains and IPs/CIDRs go DIRECT (outside the VPN). Use it for banks, games, sites that block VPNs or your local network.`n`nExamples: netflix.com / 10.0.0.0/8. TUN mode only; applies on reconnect." = "Split tunneling`n`nDomínios e IPs/CIDRs listados saem DIRETO (sem VPN). Use para bancos, jogos, sites que bloqueiam VPN ou a sua rede local.`n`nExemplos: netflix.com / 10.0.0.0/8. Só no modo TUN; aplica ao reconectar."
+        "System proxy`n`nConfigures the Windows HTTP proxy (HTTP and HTTPS leave via 127.0.0.1). Only apps that respect the system proxy go through the VPN (browser, Discord text/API).`n`nApps using UDP/WebRTC (Discord voice, games) IGNORE the proxy and go direct. To route everything, use TUN mode." = "Proxy do sistema`n`nConfigura o proxy HTTP do Windows (HTTP e HTTPS saem por 127.0.0.1). Só os apps que respeitam o proxy do sistema passam pela VPN (navegador, Discord texto/API).`n`nApps que usam UDP/WebRTC (voz do Discord, jogos) IGNORAM o proxy e vão direto. Para rotear tudo, use o Modo TUN."
+        "TUN mode`n`nCreates a virtual network adapter and routes ALL system traffic through the VPN - including Discord voice (UDP/WebRTC), games and apps that ignore proxies.`n`nDifference: the system proxy only covers apps that respect it; TUN covers everything.`n`nRequires running as administrator." = "Modo TUN`n`nCria um adaptador de rede virtual e roteia TODO o tráfego do sistema pela VPN - incluindo voz do Discord (UDP/WebRTC), jogos e apps que ignoram proxy.`n`nDiferença: o Proxy do sistema só pega apps que respeitam proxy; o TUN pega tudo.`n`nRequer executar como administrador."
+
+        '{0} direct rule(s) - TUN mode only' = '{0} regra(s) diretas - só no modo TUN'
+        'no rules - TUN mode only' = 'sem regras - só no modo TUN'
+        'No servers in {0}' = 'Nenhum servidor em {0}'
+        "No servers matching '{0}'" = "Nenhum servidor para '{0}'"
+        'No working servers - click REFRESH again' = 'Nenhum servidor estável - clique em ATUALIZAR de novo'
+        'No servers - click REFRESH' = 'Nenhum servidor - clique em ATUALIZAR'
+        'Connecting...' = 'Conectando...'
+        'Connecting (trying servers)...' = 'Conectando (testando servidores)...'
+        'Connected: {0}' = 'Conectado: {0}'
+        'Failed: {0}' = 'Falha: {0}'
+        'Refreshing and testing servers...' = 'Atualizando e testando servidores...'
+        'Downloading list and testing (TCP+UDP)...' = 'Baixando lista e testando (TCP+UDP)...'
+        '{0} working servers' = '{0} servidores estáveis'
+        'Select a server in the list' = 'Selecione um servidor na lista'
+        'Connecting: {0}' = 'Conectando: {0}'
+        'state:Disconnected' = 'Desconectado'
+        'System proxy disabled' = 'Proxy do sistema desativado'
+        'System proxy re-enabled on connect' = 'Proxy do sistema reativado ao conectar'
+        'TUN mode off' = 'Modo TUN desativado'
+        'Kill switch off' = 'Kill switch desativado'
+        'TUN mode off (proxy active)' = 'Modo TUN desativado (proxy ativo)'
+        'Kill switch off (requires TUN mode)' = 'Kill switch desativado (precisa do modo TUN)'
+        'System proxy not enabled: connect first' = 'Proxy do sistema não ativado: conecte primeiro'
+        'System proxy enabled (HTTP 127.0.0.1:{0})' = 'Proxy do sistema ativado (HTTP 127.0.0.1:{0})'
+        'Discord voice (UDP) bypasses the proxy - use TUN mode' = 'Voz do Discord (UDP) ignora proxy - use o modo TUN'
+        'Proxy off (TUN covers the whole network)' = 'Proxy desativado (TUN cobre toda a rede)'
+        'TUN mode on - routes the whole network (requires admin)' = 'Modo TUN ativado - roteia toda a rede (requer admin)'
+        'Connected (TUN {0})' = 'Conectado (TUN {0})'
+        'Kill switch requires TUN mode (turn on TUN first)' = 'Kill switch exige o modo TUN (ative TUN primeiro)'
+        'Kill switch ON: all traffic outside the tunnel will be blocked' = 'Kill switch ON: toda saída fora do túnel será bloqueada'
+        'state:Kill switch OFF' = 'Kill switch OFF'
+        'Kill switch NOT applied - see the log (killswitch)' = 'Kill switch NÃO aplicado - veja o log (killswitch)'
+        'Failed to open settings: {0}' = 'Falha ao abrir configurações: {0}'
+        'Sorted by latency: highest first' = 'Ordenado por latência: maior primeiro'
+        'Sorted by latency: lowest first' = 'Ordenado por latência: menor primeiro'
+        'Activity copied ({0} lines)' = 'Atividade copiada ({0} linha(s))'
+        'Copy failed: {0}' = 'Falha ao copiar: {0}'
+        'Still running in the tray. Use Exit in the tray menu to quit.' = 'Continua rodando na bandeja. Use Sair no menu do ícone para encerrar.'
+        'Reconnected: {0}' = 'Reconectado: {0}'
+        'TUNNEL DROPPED - reconnecting...' = 'TÚNEL CAIU - reconectando...'
+        'Reconnect failed' = 'Falha ao reconectar'
+        'Ready. Refresh the server list.' = 'Pronto. Atualize os servidores.'
+        'Reconnecting to apply split tunneling...' = 'Reconectando para aplicar o split tunneling...'
+        'Split tunneling saved: {0} direct rule(s)' = 'Split tunneling salvo: {0} regra(s) direta(s)'
+        'Failed to save split tunneling: {0}' = 'Falha ao salvar split tunneling: {0}'
+        'Turn on TUN mode for split tunneling to apply' = 'Ative o modo TUN para o split tunneling valer'
+        'Failed to open the editor: {0}' = 'Falha ao abrir o editor: {0}'
+        'System proxy disabled (no connection)' = 'Proxy do sistema desativado (sem conexão)'
+        'System proxy enabled: traffic going through the tunnel' = 'Proxy do sistema ativado: tráfego pelo túnel'
+        'System proxy not enabled: turn on TUN in settings' = 'Proxy do sistema não ativado: ative TUN nas configurações'
+        'ACTIVE - nothing leaks outside the tunnel' = 'ATIVO - nada vaza fora do túnel'
+        'blocks everything outside the tunnel · TUN only' = 'bloqueia tudo fora do túnel · só TUN'
+        '  |  exit: {0}' = '  |  saída: {0}'
+        '{0} of {1}' = '{0} de {1}'
+        '{0}% - ~{1}m{2}s left' = '{0}% - restante ~{1}m{2}s'
+        '{0}% - ~{1}s left' = '{0}% - restante ~{1}s'
+
+        'Refresh the list first' = 'Atualize a lista primeiro'
+        'Connecting ({0}/{1}): {2}' = 'Conectando ({0}/{1}): {2}'
+        'Failed after {0}: {1}' = 'Falhou em {0}: {1}'
+        'Failed on {0} servers - click REFRESH' = 'Falhou em {0} servidores - clique em ATUALIZAR'
+        'Trying: {0} ({1}ms)' = 'Tentando: {0} ({1}ms)'
+        'Pool exhausted - rebuilding...' = 'Pool esgotado - refazendo...'
+        'No servers found' = 'Nenhum servidor encontrado'
+        'All failed: {0}' = 'Falhou em todos: {0}'
+        'All servers failed' = 'Falhou em todos os servidores'
+        'No working servers' = 'Nenhum servidor estável'
+        'Working servers: {0}' = 'Estáveis: {0} servidores'
+        'No server selected' = 'Nenhum servidor selecionado'
+        'Failed to connect to {0}' = 'Falha ao conectar em {0}'
+        'TUN mode on (applies on connect)' = 'Modo TUN ativado (aplica ao conectar)'
+        'Reconnecting with TUN...' = 'Reconectando com TUN...'
+        'Reconnecting without TUN...' = 'Reconectando sem TUN...'
+        'Connected (TUN ON)' = 'Conectado (TUN ON)'
+        'Connected (TUN OFF)' = 'Conectado (TUN OFF)'
+        'Reconnect failed: {0}' = 'Falha ao reconectar: {0}'
+        'Reconnect failed with TUN mode' = 'Falha ao reconectar com modo TUN'
+
+        'Testing connectivity for {0} configs...' = 'Testando conectividade de {0} servidores...'
+        'Found {0} reachable servers' = 'Encontrados {0} servidores acessíveis'
+        'Working (TCP+UDP, {0}ms real): {1}' = 'Estável (TCP+UDP, {0}ms real): {1}'
+        'Working (TCP+UDP): {0}' = 'Estável (TCP+UDP): {0}'
+        'Stopping scan: {0} working servers' = 'Encerrando teste: {0} servidores estáveis'
+        'Discarded: {0}' = 'Descartado: {0}'
+        'Downloading {0}...' = 'Baixando {0}...'
+        'Downloaded and cached {0}' = 'Baixado e cacheado {0}'
+        'Using cached {0} (updated {1} min ago)' = 'Usando cache de {0} (atualizado há {1} min)'
+        'Using cached {0} (updated {1} hours ago)' = 'Usando cache de {0} (atualizado há {1} h)'
+        'Failed to download {0}: {1}' = 'Falha ao baixar {0}: {1}'
+        'Removed {0} duplicate configs (mirrors)' = 'Removidos {0} duplicados (espelhos)'
+        'Found {0} configs (after filtering)' = 'Encontrados {0} configs (após filtro)'
+        'Previous TUN session stopped' = 'Sessão TUN anterior encerrada'
+        'Restoring firewall (kill switch) from the previous run...' = 'Restaurando firewall (kill switch) da execução anterior...'
+        'Firewall restored' = 'Firewall restaurado'
+        'FAILED to restore the firewall: accept UAC or restore the outbound profile in Windows Defender Firewall' = 'FALHA ao restaurar o firewall: aceite o UAC ou restaure o perfil de saída no Windows Defender Firewall'
+        'Firewall STILL blocking (kill switch) - restore the outbound profile manually' = 'Firewall AINDA bloqueando (kill switch) - restaure o perfil de saída manualmente'
+        'System proxy restored (previous run crashed with proxy active)' = 'Proxy do sistema restaurado (execução anterior caiu com proxy ativo)'
+        'System proxy not enabled: nothing listening on 127.0.0.1:{0} (connect first)' = 'Proxy do sistema não ativado: nada escutando em 127.0.0.1:{0} (conecte primeiro)'
+        'System proxy is not under SettVPN control - nothing to restore' = 'Proxy do sistema não está sob controle do SettVPN - nada a restaurar'
+        'System proxy enabled: http/https 127.0.0.1:{0}' = 'Proxy do sistema ativado: http/https 127.0.0.1:{0}'
+        'VPN disconnected' = 'VPN desconectada'
+        'Connected to VPN: {0}' = 'Conectado à VPN: {0}'
+        'Protocol: {0} | Server: {1} | Ping: {2}ms' = 'Protocolo: {0} | Servidor: {1} | Ping: {2}ms'
+        'Exit IP: {0}' = 'IP de saída: {0}'
+        'Tunnel check failed: {0}{1}' = 'Teste do túnel falhou: {0}{1}'
+        'Server unstable (dropped): {0}{1}' = 'Servidor instável (caiu): {0}{1}'
+        'v2ray process exited: {0}{1}' = 'Processo v2ray encerrou: {0}{1}'
+        'wintun.dll missing - TUN mode unavailable' = 'wintun.dll ausente - modo TUN indisponível'
+        'Failed to generate xray config' = 'Falha ao gerar config do xray'
+        'TUN failed - traffic leaking. {0}' = 'TUN falhou - tráfego vazando. {0}'
+        'System proxy enabled' = 'Proxy do sistema ativado'
+        'Failed to start v2ray: {0}' = 'Falha ao iniciar v2ray: {0}'
+    }
+}
+
 
 function Get-ConfigKey {
     param([hashtable]$Config)
@@ -536,18 +817,18 @@ function Get-CachedContent {
     if (Test-Path $Cache) {
         $cacheAge = (Get-Date) - (Get-Item $Cache).LastWriteTime
         if ($cacheAge.TotalMinutes -lt 10) {
-            Write-Status "Using cached $Label (updated $([math]::Round($cacheAge.TotalMinutes, 1)) min ago)" "INFO"
+            Write-Status ((T 'Using cached {0} (updated {1} min ago)') -f $Label, ([math]::Round($cacheAge.TotalMinutes, 1))) "INFO"
             return Get-Content $Cache -Raw
         }
     }
 
     try {
-        Write-Status "Downloading $Label..." "INFO"
+        Write-Status ((T 'Downloading {0}...') -f $Label) "INFO"
         $response = Invoke-WebRequest -Uri $Url -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
         $content = $response.Content
 
         Set-Content -Path $Cache -Value $content -Encoding UTF8
-        Write-Status "Downloaded and cached $Label" "OK"
+        Write-Status ((T 'Downloaded and cached {0}') -f $Label) "OK"
         return $content
     }
     catch {
@@ -555,7 +836,7 @@ function Get-CachedContent {
 
         if (Test-Path $Cache) {
             $cacheAge = (Get-Date) - (Get-Item $Cache).LastWriteTime
-            Write-Status "Using cached $Label (updated $([math]::Round($cacheAge.TotalHours, 1)) hours ago)" "WARN"
+            Write-Status ((T 'Using cached {0} (updated {1} hours ago)') -f $Label, ([math]::Round($cacheAge.TotalHours, 1))) "WARN"
             return Get-Content $Cache -Raw
         }
         return $null
@@ -664,13 +945,13 @@ function Get-AllConfigs {
         }
     }
     $dupes = $configs.Count - $unique.Count
-    if ($dupes -gt 0) { Write-Status "Removed $dupes duplicate configs (mirrors)" "INFO" }
+    if ($dupes -gt 0) { Write-Status ((T 'Removed {0} duplicate configs (mirrors)') -f $dupes) "INFO" }
     $configs = $unique
 
     if ($configs.Count -gt 400) {
         $configs = @($configs[0..399])
     }
-    Write-Status "Found $($configs.Count) configs (after filtering)" "INFO"
+    Write-Status ((T 'Found {0} configs (after filtering)') -f $configs.Count) "INFO"
     return $configs
 }
 
@@ -720,7 +1001,7 @@ function Get-ConfigsWithPing {
     param([array]$Configs, [int]$BatchSize = 64)
 
     $n = $Configs.Count
-    Write-Status "Testing connectivity for $n configs..." "INFO"
+    Write-Status ((T 'Testing connectivity for {0} configs...') -f $n) "INFO"
 
     $timeoutMs = 3000
 
@@ -799,7 +1080,7 @@ function Get-ConfigsWithPing {
         $sorted = @()
     }
 
-    Write-Status "Found $($sorted.Count) reachable servers" "OK"
+    Write-Status ((T 'Found {0} reachable servers') -f $sorted.Count) "OK"
     return $sorted
 }
 
@@ -1532,17 +1813,17 @@ $scanReal[$scanSlot] = $Script:LastRealPing
             $fin.Cfg.RealPing = $real
             $stable += $fin.Cfg
             if ($real -gt 0 -and $real -lt 9999) {
-                Write-Status "Working (TCP+UDP, ${real}ms real): $(Get-ShortName $fin.Cfg.Name)" "OK"
+                Write-Status ((T 'Working (TCP+UDP, {0}ms real): {1}') -f $real, (Get-ShortName $fin.Cfg.Name)) "OK"
             }
             else {
-                Write-Status "Working (TCP+UDP): $(Get-ShortName $fin.Cfg.Name)" "OK"
+                Write-Status ((T 'Working (TCP+UDP): {0}') -f (Get-ShortName $fin.Cfg.Name)) "OK"
             }
             if ($MinStable -gt 0 -and $stable.Count -ge $MinStable) {
-                Write-Status "Stopping scan: $($stable.Count) working servers" "OK"
+                Write-Status ((T 'Stopping scan: {0} working servers') -f $stable.Count) "OK"
             }
         }
         else {
-            Write-Status "Discarded: $(Get-ShortName $fin.Cfg.Name)" "WARN"
+            Write-Status ((T 'Discarded: {0}') -f (Get-ShortName $fin.Cfg.Name)) "WARN"
         }
 
         # ETA adaptativo: media real de tempo por servidor x servidores restantes
@@ -1588,6 +1869,23 @@ function Get-CountryNamePt {
     param([string]$Code)
 
     if (-not $Code) { return "" }
+
+    # Ingles: nome oficial do .NET (evita manter duas tabelas). PT: mapa abaixo.
+    $lang = 'en'
+    if (Get-Variable -Name 'Language' -Scope Script -ErrorAction SilentlyContinue) { $lang = $Script:Language }
+    if ($lang -ne 'pt') {
+        try {
+            $ri = New-Object System.Globalization.RegionInfo($Code)
+            if ($ri.EnglishName) { return $ri.EnglishName }
+        }
+        catch { }
+        if (-not (Get-Variable -Name 'EnglishCountryMap' -Scope Script -ErrorAction SilentlyContinue)) {
+            # Codigos que o .NET nao reconhece.
+            $Script:EnglishCountryMap = @{ 'XK' = 'Kosovo' }
+        }
+        if ($Script:EnglishCountryMap.ContainsKey($Code)) { return $Script:EnglishCountryMap[$Code] }
+    }
+
     if (-not (Get-Variable -Name 'CountryMap' -Scope Script -ErrorAction SilentlyContinue)) {
         $Script:CountryMap = @{
             'US' = 'Estados Unidos'; 'BR' = 'Brasil'; 'FR' = 'Franca'; 'RU' = 'Russia';
@@ -1923,7 +2221,7 @@ function Start-V2Ray {
 
     # TUN no Windows exige o driver wintun.dll ao lado do v2ray.exe
     if ($Tun -and (-not $Script:WintunDll -or -not (Test-Path $Script:WintunDll))) {
-        $Script:LastFailReason = "wintun.dll missing - TUN mode unavailable"
+        $Script:LastFailReason = (T 'wintun.dll missing - TUN mode unavailable')
         Write-Status $Script:LastFailReason "ERROR"
         return $false
     }
@@ -1933,7 +2231,7 @@ function Start-V2Ray {
 
     # Generate config
     if (-not (Generate-V2RayConfig -Config $Config -Tun $Tun -ApiPort (Get-ScriptPort 'ApiPort' 10085))) {
-        $Script:LastFailReason = "Failed to generate xray config"
+        $Script:LastFailReason = (T 'Failed to generate xray config')
         return $false
     }
 
@@ -2007,7 +2305,7 @@ function Start-V2Ray {
             Start-Sleep -Milliseconds 500
         }
         if (-not $ready) {
-            $Script:LastFailReason = "Tunnel check failed: $(Get-ShortName $Config.Name)$(Get-FailReason)"
+            $Script:LastFailReason = (T 'Tunnel check failed: {0}{1}') -f (Get-ShortName $Config.Name), (Get-FailReason)
             Write-Status $Script:LastFailReason "WARN"
             Stop-V2Ray
             return $false
@@ -2023,7 +2321,7 @@ function Start-V2Ray {
             if (-not $tunOk) {
                 $tail = Get-XrayLogTail
                 $reason = if ($tail) { "Log: $tail" } else { "driver wintun ausente?" }
-                $Script:LastFailReason = "TUN failed - traffic leaking. $reason"
+                $Script:LastFailReason = (T 'TUN failed - traffic leaking. {0}') -f $reason
                 Write-Status $Script:LastFailReason "ERROR"
                 Stop-V2Ray
                 return $false
@@ -2037,13 +2335,13 @@ function Start-V2Ray {
         for ($i = 0; $i -lt $checks; $i++) {
             Start-Sleep -Seconds 1
             if (-not ($Script:V2RayProcess -and -not $Script:V2RayProcess.HasExited)) {
-                $Script:LastFailReason = "v2ray process exited: $(Get-ShortName $Config.Name)$(Get-FailReason)"
+                $Script:LastFailReason = (T 'v2ray process exited: {0}{1}') -f (Get-ShortName $Config.Name), (Get-FailReason)
                 Write-Status $Script:LastFailReason "ERROR"
                 Stop-V2Ray
                 return $false
             }
             if (-not (Test-V2RayTunnel -Attempts 1 -TimeoutMs 2500)) {
-                $Script:LastFailReason = "Server unstable (dropped): $(Get-ShortName $Config.Name)$(Get-FailReason)"
+                $Script:LastFailReason = (T 'Server unstable (dropped): {0}{1}') -f (Get-ShortName $Config.Name), (Get-FailReason)
                 Write-Status $Script:LastFailReason "WARN"
                 Stop-V2Ray
                 return $false
@@ -2054,11 +2352,11 @@ function Start-V2Ray {
             $socksPort = Get-ScriptPort 'SocksPort' 10808
             $httpPort = Get-ScriptPort 'HttpPort' 10809
 
-            Write-Status "Connected to VPN: $(Get-ShortName $Config.Name)" "OK"
-            Write-Status "Protocol: $($Config.Protocol) | Server: $($Config.Host):$($Config.Port) | Ping: $($Config.Ping)ms" "INFO"
+            Write-Status ((T 'Connected to VPN: {0}') -f (Get-ShortName $Config.Name)) "OK"
+            Write-Status ((T 'Protocol: {0} | Server: {1} | Ping: {2}ms') -f $Config.Protocol, "$($Config.Host):$($Config.Port)", $Config.Ping) "INFO"
 
             $Script:ExitIp = Get-ExitIp
-            if ($Script:ExitIp) { Write-Status "Exit IP: $($Script:ExitIp)" "INFO" }
+            if ($Script:ExitIp) { Write-Status ((T 'Exit IP: {0}') -f $Script:ExitIp) "INFO" }
 
             Write-Host ""
             Write-Host "  =============================================" -ForegroundColor Cyan
@@ -2080,7 +2378,7 @@ function Start-V2Ray {
         }
     }
     catch {
-        $Script:LastFailReason = "Failed to start v2ray: $_"
+        $Script:LastFailReason = (T 'Failed to start v2ray: {0}') -f $_
         Write-Status $Script:LastFailReason "ERROR"
         return $false
     }
@@ -2112,7 +2410,7 @@ function Stop-V2Ray {
                 }
             }
             $Script:V2RayProcess.Dispose()
-            Write-Status "VPN disconnected" "OK"
+            Write-Status (T 'VPN disconnected') "OK"
         }
         catch {
             Write-Status "Error stopping v2ray: $_" "WARN"
@@ -2470,7 +2768,7 @@ function Restore-OrphanProxy {
             $enable = 0
             if ($null -ne (Get-PropOr $obj 'Enable')) { $enable = [int](Get-PropOr $obj 'Enable') }
             Set-ProxyRegistry -Enable $enable -Server ([string](Get-PropOr $obj 'Server' '')) -Override ([string](Get-PropOr $obj 'Override' ''))
-            Write-Status "System proxy restored (previous run crashed with proxy active)" "WARN"
+            Write-Status (T 'System proxy restored (previous run crashed with proxy active)') "WARN"
         }
     }
     catch { }
@@ -2495,7 +2793,7 @@ function Enable-SystemProxy {
 
     # Proxy apontando p/ porta morta derruba a navegacao do usuario inteira.
     if (-not (Test-LocalPort -Port $httpPort)) {
-        Write-Status "System proxy not enabled: nothing listening on 127.0.0.1:$httpPort (connect first)" "WARN"
+        Write-Status ((T 'System proxy not enabled: nothing listening on 127.0.0.1:{0} (connect first)') -f $httpPort) "WARN"
         return $false
     }
 
@@ -2511,14 +2809,14 @@ function Enable-SystemProxy {
     # Sem entrada socks=: WinINET ignora e apps que leem o registro pegam lixo.
     Set-ProxyRegistry -Enable 1 -Server "http=127.0.0.1:$httpPort;https=127.0.0.1:$httpPort" -Override (New-ProxyOverride -Current ([string]$Script:ProxyBackupOverride))
     $Script:ProxyActive = $true
-    Write-Status "System proxy enabled: http/https 127.0.0.1:$httpPort" "OK"
+    Write-Status ((T 'System proxy enabled: http/https 127.0.0.1:{0}') -f $httpPort) "OK"
     return $true
 }
 
 function Disable-SystemProxy {
     # $Script:ProxyActive nao sobrevive a troca de runspace; o backup em disco sim.
     if (-not (Test-Path $Script:ProxyBackupFile) -and -not $Script:ProxyActive -and $null -eq $Script:ProxyBackupEnable) {
-        Write-Status "System proxy is not under SettVPN control - nothing to restore" "INFO"
+        Write-Status (T 'System proxy is not under SettVPN control - nothing to restore') "INFO"
         return
     }
 

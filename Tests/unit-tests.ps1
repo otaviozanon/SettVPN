@@ -69,16 +69,49 @@ Assert-True (($d1 - $d2) -ge 0 -and ($d1 - $d2) -le 2) "Cai ~1s por segundo (del
 
 Write-Host "`n== Bug 4: mapeamento de pais ==" -ForegroundColor Cyan
 
+$Script:Language = 'pt'
 Assert-Equal (Get-CountryNamePt -Code 'BR') 'Brasil' 'Pais BR -> Brasil'
 Assert-Equal (Get-CountryNamePt -Code 'US') 'Estados Unidos' 'Pais US -> Estados Unidos'
 Assert-Equal (Get-CountryNamePt -Code 'FR') 'Franca' 'Pais FR -> Franca'
 Assert-Equal (Get-CountryNamePt -Code 'RU') 'Russia' 'Pais RU -> Russia'
 Assert-Equal (Get-CountryNamePt -Code 'DE') 'Alemanha' 'Pais DE -> Alemanha'
+$Script:Language = 'en'
+Assert-Equal (Get-CountryNamePt -Code 'BR') 'Brazil' 'Pais BR -> Brazil (ingles)'
+Assert-Equal (Get-CountryNamePt -Code 'NL') 'Netherlands' 'Pais NL -> Netherlands (ingles)'
 Assert-Equal (Get-CountryNamePt -Code '') '' 'Codigo vazio -> vazio'
 Assert-Equal (Get-CountryNamePt -Code 'ZZ') 'ZZ' 'Codigo desconhecido -> retorna o proprio codigo'
 Assert-Equal (Get-CountryCodeFromName -Name 'US_speednode_0123') 'US' 'Inferencia de pais pelo nome (US)'
 Assert-Equal (Get-CountryCodeFromName -Name '??+CloudFlare??') '' 'Nome sem codigo -> vazio'
 Assert-Equal (Get-CountryCodeFromName -Name 'VPS-BR-01') 'BR' 'Inferencia pelo nome (BR)'
+
+Write-Host "`n== Settings, idioma e autostart ==" -ForegroundColor Cyan
+$Script:SettingsFile = Join-Path ([System.IO.Path]::GetTempPath()) ("settvpn-test-" + [guid]::NewGuid().ToString('N') + "\settings.json")
+$s = Get-AppSettings
+Assert-Equal $s.Language 'en' 'Settings: padrao en'
+Assert-Equal $s.StartMinimized $false 'Settings: padrao nao minimizado'
+$s.StartMinimized = $true; $s.StartWithWindows = $true; $s.Language = 'pt'
+Assert-True (Save-AppSettings $s) 'Settings: salva arquivo'
+$s2 = Get-AppSettings
+Assert-Equal $s2.Language 'pt' 'Settings: idioma persiste'
+Assert-Equal $s2.StartMinimized $true 'Settings: minimizado persiste'
+Assert-Equal $s2.StartWithWindows $true 'Settings: autostart persiste'
+Remove-Item (Split-Path -Parent $Script:SettingsFile) -Recurse -Force -ErrorAction SilentlyContinue
+
+$Script:Language = 'en'
+Assert-Equal (T 'CONNECT') 'CONNECT' 'T: ingles devolve original'
+$Script:Language = 'pt'
+Assert-Equal (T 'CONNECT') 'CONECTAR' 'T: traduz botao'
+Assert-Equal (T 'Texto sem traducao') 'Texto sem traducao' 'T: chave ausente devolve original'
+Assert-Equal ((T 'Working servers: {0}') -f 7) ('Est' + [char]0xE1 + 'veis: 7 servidores') 'T: template formatado'
+$Script:Language = 'en'
+Assert-Equal (T 'CONECTAR') 'CONNECT' 'T: volta ao ingles'
+
+$testKey = 'HKCU:\Software\SettVPN-Test'
+Assert-True (Set-AutoStart -Enabled $true -RunKey $testKey) 'Autostart: grava entrada'
+Assert-True (Test-AutoStart -RunKey $testKey) 'Autostart: detecta entrada'
+Assert-True (Set-AutoStart -Enabled $false -RunKey $testKey) 'Autostart: remove entrada'
+Assert-True (-not (Test-AutoStart -RunKey $testKey)) 'Autostart: entrada removida'
+Remove-Item $testKey -Recurse -Force -ErrorAction SilentlyContinue
 
 # Servidores de menor ping (CDN) costumam estar mortos: amostra precisa se espalhar.
 $spreadAll = @(Get-SpreadSample -Items @(1, 2, 3) -Max 12)

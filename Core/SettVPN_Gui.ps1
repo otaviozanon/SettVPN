@@ -74,6 +74,8 @@ Set-StrictMode -Version Latest
 `$Script:AbcConfigsUrl = '$($Script:AbcConfigsUrl)'
 `$Script:SubConfigsUrl = '$($Script:SubConfigsUrl)'
 `$Script:Sub2ConfigsUrl = '$($Script:Sub2ConfigsUrl)'
+`$Script:SettingsFile = '$($Script:SettingsFile)'
+`$Script:Language = '$($Script:Language)'
 `$Script:V2RayProcess = `$null
 `$Script:CurrentConfig = `$null
 `$Script:ProxyActive = `$false
@@ -132,23 +134,23 @@ function Set-GuiBusy {
 function Update-GuiStatus {
     $cfg = $Script:GuiSync.ConnectedConfig
     if ($cfg) {
-        $Script:GuiLblStatus.Text = "CONNECTED"
+        $Script:GuiLblStatus.Text = T 'CONNECTED'
         $Script:GuiLblStatus.Foreground = $Script:BrushGreen
         $Script:GuiDotStatus.Fill = $Script:BrushGreen
         $srvLabel = [string]$cfg.Name
-        $country = [string]$cfg['Country']
+        $country = Get-CountryLabel -Config $cfg
         if ($country) { $srvLabel += "  ($country)" }
         $Script:GuiLblServer.Text = $srvLabel
         $pingLine = "Ping: $(Get-ServerPingMs -Config $cfg)ms  |  $($cfg.Protocol)  |  $($cfg.Host):$($cfg.Port)"
-        if ($Script:GuiSync.ExitIp) { $pingLine += "  |  saida: $($Script:GuiSync.ExitIp)" }
+        if ($Script:GuiSync.ExitIp) { $pingLine += (T '  |  exit: {0}') -f $Script:GuiSync.ExitIp }
         $Script:GuiLblPing.Text = $pingLine
     }
     else {
-        $Script:GuiLblStatus.Text = "DISCONNECTED"
+        $Script:GuiLblStatus.Text = T 'DISCONNECTED'
         $Script:GuiLblStatus.Foreground = $Script:BrushRed
         $Script:GuiDotStatus.Fill = $Script:BrushRed
-        $Script:GuiLblServer.Text = "Not connected"
-        $Script:GuiLblPing.Text = "Connect to hide your IP"
+        $Script:GuiLblServer.Text = T 'Not connected'
+        $Script:GuiLblPing.Text = T 'Connect to hide your IP'
     }
     # Nao ha o que desconectar quando offline.
     if ($Script:GuiBtnDisconnect) {
@@ -168,7 +170,7 @@ function Sync-SystemProxy {
         if ($Script:ProxyAutoOn -and $Script:ProxyActive) {
             Disable-SystemProxy
             Update-ProxyButton
-            Add-GuiLog "System proxy disabled (no connection)" "WARN"
+            Add-GuiLog (T 'System proxy disabled (no connection)') "WARN"
         }
         $Script:ProxyAutoOn = $false
         return
@@ -178,10 +180,78 @@ function Sync-SystemProxy {
     if (Enable-SystemProxy) {
         $Script:ProxyAutoOn = $true
         Update-ProxyButton
-        Add-GuiLog "System proxy enabled: traffic going through the tunnel" "OK"
+        Add-GuiLog (T 'System proxy enabled: traffic going through the tunnel') "OK"
     }
     else {
-        Add-GuiLog "System proxy not enabled: turn on TUN in settings" "WARN"
+        Add-GuiLog (T 'System proxy not enabled: turn on TUN in settings') "WARN"
+    }
+}
+
+function Set-ToggleButton {
+    param($Button, [bool]$On)
+    if (-not $Button) { return }
+    $Button.Content = if ($On) { 'ON' } else { 'OFF' }
+    $Button.Foreground = if ($On) { $Script:BrushGreen } else { $Script:BrushMuted }
+    $Button.BorderBrush = if ($On) { $Script:BrushGreen } else { $Script:BrushBorder }
+}
+
+function Update-StartMinButton {
+    Set-ToggleButton $Script:GuiBtnStartMin ([bool]$Script:AppSettings.StartMinimized)
+}
+
+function Update-StartWinButton {
+    Set-ToggleButton $Script:GuiBtnStartWin ([bool]$Script:AppSettings.StartWithWindows)
+}
+
+function Update-LanguageButton {
+    if (-not $Script:GuiBtnLanguage) { return }
+    $Script:GuiBtnLanguage.Content = if ($Script:Language -eq 'pt') { 'PORTUGUÊS' } else { 'ENGLISH' }
+    $Script:GuiBtnLanguage.Foreground = if ($Script:Language -eq 'pt') { $Script:BrushGold } else { $Script:BrushText }
+}
+
+function Translate-UiTree {
+    param($Element)
+
+    # Troca textos estaticos do XAML pelo idioma atual (a fonte da verdade e o ingles).
+    if (-not $Element) { return }
+    try {
+        if ($Element -is [System.Windows.Window]) { $Element.Title = T ([string]$Element.Title) }
+        if ($Element -is [System.Windows.Controls.TextBlock]) {
+            if ($Element.Text) { $Element.Text = T ([string]$Element.Text) }
+        }
+        elseif ($Element -is [System.Windows.Controls.Button]) {
+            if ($Element.Content -is [string]) { $Element.Content = T ([string]$Element.Content) }
+        }
+        if ($Element -is [System.Windows.FrameworkElement] -and $Element.ToolTip -is [string]) {
+            $Element.ToolTip = T ([string]$Element.ToolTip)
+        }
+    }
+    catch { }
+
+    foreach ($child in [System.Windows.LogicalTreeHelper]::GetChildren($Element)) {
+        if ($child -is [System.Windows.DependencyObject]) { Translate-UiTree $child }
+    }
+}
+
+function Apply-Language {
+    Translate-UiTree $Script:GuiWindow
+    Translate-UiTree $Script:GuiSettings
+    if ($Script:SplitDialog) { Translate-UiTree $Script:SplitDialog }
+
+    Update-ProxyButton
+    Update-TunButton
+    Update-KsButton
+    Update-StartMinButton
+    Update-StartWinButton
+    Update-LanguageButton
+    Update-SplitLabel
+    Update-GuiStatus
+    Populate-ServerList
+
+    if ($Script:TrayMenu) {
+        foreach ($k in @('Open', 'Connect', 'Disconnect', 'Tun', 'Exit')) {
+            if ($Script:TrayMenu.ContainsKey($k)) { $Script:TrayMenu[$k].Text = T $Script:TrayMenuText[$k] }
+        }
     }
 }
 
@@ -229,7 +299,7 @@ function Update-KsButton {
 function Update-SplitLabel {
     if (-not $Script:GuiLblSplit) { return }
     $n = @(Get-SplitDirectLines).Count
-    $Script:GuiLblSplit.Text = if ($n -gt 0) { "$n direct rule(s) - TUN mode only" } else { "no rules - TUN mode only" }
+    $Script:GuiLblSplit.Text = if ($n -gt 0) { (T '{0} direct rule(s) - TUN mode only') -f $n } else { T 'no rules - TUN mode only' }
 }
 
 function Start-GuiStats {
@@ -362,10 +432,11 @@ function Show-SplitDialog {
     try {
         $reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
         $Script:SplitDialog = [Windows.Markup.XamlReader]::Load($reader)
+        Translate-UiTree $Script:SplitDialog
         $Script:SplitDialog.Add_SourceInitialized({ param($s, $e) Set-DarkTitleBar $s })
     }
     catch {
-        Add-GuiLog "Failed to open the editor: $_" "ERROR"
+        Add-GuiLog ((T 'Failed to open the editor: {0}') -f $_) "ERROR"
         return
     }
 
@@ -386,20 +457,20 @@ function Show-SplitDialog {
     $lines = @($Script:SplitDialogText.Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
     try {
         [System.IO.File]::WriteAllLines($Script:SplitFile, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
-        Add-GuiLog "Split tunneling saved: $($lines.Count) direct rule(s)" "OK"
+        Add-GuiLog ((T 'Split tunneling saved: {0} direct rule(s)') -f $lines.Count) "OK"
     }
     catch {
-        Add-GuiLog "Failed to save split tunneling: $_" "ERROR"
+        Add-GuiLog ((T 'Failed to save split tunneling: {0}') -f $_) "ERROR"
         return
     }
     Update-SplitLabel
 
     if ($Script:GuiSync.ConnectedConfig -and $Script:GuiSync.TunEnabled) {
-        Add-GuiLog "Reconnecting to apply split tunneling..." "INFO"
+        Add-GuiLog (T 'Reconnecting to apply split tunneling...') "INFO"
         Invoke-Background -OpScript $Script:tunToggleScript -OnComplete { Update-GuiStatus }
     }
     elseif ($lines.Count -gt 0) {
-        Add-GuiLog "Turn on TUN mode for split tunneling to apply" "WARN"
+        Add-GuiLog (T 'Turn on TUN mode for split tunneling to apply') "WARN"
     }
 }
 
@@ -407,7 +478,7 @@ function Update-CountryFilter {
     if (-not $Script:GuiCbCountry) { return }
 
     $countries = @(@($Script:GuiSync.Servers) |
-        ForEach-Object { [string]$_['Country'] } |
+        ForEach-Object { Get-CountryLabel -Config $_ } |
         Where-Object { $_ } |
         Sort-Object -Unique)
     $sig = $countries -join '|'
@@ -419,7 +490,7 @@ function Update-CountryFilter {
     try {
         $prev = [string]$Script:GuiCbCountry.SelectedItem
         $Script:GuiCbCountry.Items.Clear()
-        [void]$Script:GuiCbCountry.Items.Add("All")
+        [void]$Script:GuiCbCountry.Items.Add((T 'All'))
         foreach ($c in $countries) { [void]$Script:GuiCbCountry.Items.Add($c) }
         if ($prev -and $Script:GuiCbCountry.Items.Contains($prev)) { $Script:GuiCbCountry.SelectedItem = $prev }
         else { $Script:GuiCbCountry.SelectedIndex = 0 }
@@ -443,13 +514,14 @@ function Populate-ServerList {
     if ($Script:GuiCbCountry -and $Script:GuiCbCountry.SelectedItem) {
         $country = [string]$Script:GuiCbCountry.SelectedItem
     }
-    if ($country -and $country -ne "All") {
-        $servers = @($servers | Where-Object { [string]$_['Country'] -eq $country })
+    $allLabel = T 'All'
+    if ($country -and $country -ne $allLabel) {
+        $servers = @($servers | Where-Object { (Get-CountryLabel -Config $_) -eq $country })
     }
     if ($q) {
         $servers = @($servers | Where-Object {
             ([string]$_.Name).ToLowerInvariant().Contains($q) -or
-            ([string]$_[ 'Country']).ToLowerInvariant().Contains($q) -or
+            ((Get-CountryLabel -Config $_)).ToLowerInvariant().Contains($q) -or
             ([string]$_.Host).ToLowerInvariant().Contains($q)
         })
     }
@@ -457,17 +529,17 @@ function Populate-ServerList {
     $Script:VisibleServers = $servers
     if ($Script:GuiLblCount) {
         $total = @($Script:GuiSync.Servers).Count
-        $filtering = [bool]$q -or ($country -and $country -ne "All")
-        $Script:GuiLblCount.Text = if ($filtering) { "$($servers.Count) de $total" } else { "" }
+        $filtering = [bool]$q -or ($country -and $country -ne $allLabel)
+        $Script:GuiLblCount.Text = if ($filtering) { (T '{0} of {1}') -f $servers.Count, $total } else { "" }
     }
 
     if ($servers.Count -eq 0) {
         $ph = New-Object System.Windows.Controls.ListBoxItem
         $ph.Style = $style
-        $ph.Content = if ($country -and $country -ne "All") { "No servers in $country" }
-                      elseif ($q) { "No servers matching '$q'" }
-                      elseif ($Script:GuiSync.Filtered) { "No working servers - click REFRESH again" }
-                      else { "No servers - click REFRESH" }
+        $ph.Content = if ($country -and $country -ne $allLabel) { (T 'No servers in {0}') -f $country }
+                      elseif ($q) { (T "No servers matching '{0}'") -f $q }
+                      elseif ($Script:GuiSync.Filtered) { T 'No working servers - click REFRESH again' }
+                      else { T 'No servers - click REFRESH' }
         $ph.Foreground = $Script:BrushMuted
         $ph.FontSize = 12
         $ph.IsEnabled = $false
@@ -510,7 +582,7 @@ function Populate-ServerList {
         $tName.VerticalAlignment = "Center"
         [System.Windows.Controls.Grid]::SetColumn($tName, 1)
 
-        $country = [string]$cfg['Country']
+        $country = Get-CountryLabel -Config $cfg
         $tCountry = New-Object System.Windows.Controls.TextBlock
         $tCountry.Text = $country
         $tCountry.Foreground = $Script:BrushMuted
@@ -634,6 +706,9 @@ function Start-SettVPN-Gui {
     Add-Type -AssemblyName WindowsBase
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
+
+    $Script:AppSettings = Get-AppSettings
+    $Script:Language = [string]$Script:AppSettings.Language
 
     if (-not ("SettVPNNative" -as [type])) {
         Add-Type -TypeDefinition @"
@@ -1042,7 +1117,7 @@ public class SettVPNNative {
     [xml]$settingsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Settings" Width="480" Height="262"
+        Title="Settings" Width="480" Height="384"
         Background="#141417"
         ResizeMode="NoResize" ShowInTaskbar="False"
         WindowStartupLocation="CenterOwner">
@@ -1142,6 +1217,30 @@ public class SettVPNNative {
         </StackPanel>
         <Button x:Name="btnSplit" Grid.Column="1" Content="EDIT" Style="{StaticResource SettingToggle}"/>
       </Grid>
+      <Grid Margin="0,12,0,0">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="Start minimized" Foreground="#EDEDEF" FontSize="12" VerticalAlignment="Center"/>
+          <TextBlock Text="Open straight to the tray" Foreground="#8A8A94" FontSize="10" Margin="0,1,0,0"/>
+        </StackPanel>
+        <Button x:Name="btnStartMin" Grid.Column="1" Content="OFF" Style="{StaticResource SettingToggle}"/>
+      </Grid>
+      <Grid Margin="0,12,0,0">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="Start with Windows" Foreground="#EDEDEF" FontSize="12" VerticalAlignment="Center"/>
+          <TextBlock Text="Launch at login (asks for admin)" Foreground="#8A8A94" FontSize="10" Margin="0,1,0,0"/>
+        </StackPanel>
+        <Button x:Name="btnStartWin" Grid.Column="1" Content="OFF" Style="{StaticResource SettingToggle}"/>
+      </Grid>
+      <Grid Margin="0,12,0,0">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="Language" Foreground="#EDEDEF" FontSize="12" VerticalAlignment="Center"/>
+          <TextBlock Text="Interface language" Foreground="#8A8A94" FontSize="10" Margin="0,1,0,0"/>
+        </StackPanel>
+        <Button x:Name="btnLanguage" Grid.Column="1" Width="104" Content="ENGLISH" Style="{StaticResource SettingToggle}"/>
+      </Grid>
       <TextBlock Text="Kill switch and split tunneling only work in TUN mode." Foreground="#6A6A74" FontSize="10" Margin="0,16,0,0" TextWrapping="Wrap"/>
     </StackPanel>
   </Grid>
@@ -1209,6 +1308,9 @@ public class SettVPNNative {
     $Script:GuiBtnTun           = $Script:GuiSettings.FindName("btnTun")
     $Script:GuiBtnKs            = $Script:GuiSettings.FindName("btnKs")
     $Script:GuiBtnSplit         = $Script:GuiSettings.FindName("btnSplit")
+    $Script:GuiBtnStartMin      = $Script:GuiSettings.FindName("btnStartMin")
+    $Script:GuiBtnStartWin      = $Script:GuiSettings.FindName("btnStartWin")
+    $Script:GuiBtnLanguage      = $Script:GuiSettings.FindName("btnLanguage")
     $Script:GuiLblTraffic       = $Script:GuiWindow.FindName("lblTraffic")
     $Script:GuiPnlTraffic       = $Script:GuiWindow.FindName("pnlTraffic")
     $Script:GuiLblKs            = $Script:GuiSettings.FindName("lblKs")
@@ -1275,6 +1377,8 @@ public class SettVPNNative {
     [void]$trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     [void]$trayMenu.Items.Add($menuExit)
     $Script:TrayIcon.ContextMenuStrip = $trayMenu
+    $Script:TrayMenu = @{ Open = $menuOpen; Connect = $menuConnect; Disconnect = $menuDisconnect; Tun = $menuTun; Exit = $menuExit }
+    $Script:TrayMenuText = @{ Open = 'menu:Open'; Connect = 'menu:Connect'; Disconnect = 'menu:Disconnect'; Tun = 'menu:TUN'; Exit = 'menu:Exit' }
     $Script:TrayIcon.Add_DoubleClick({
         Show-GuiWindow
     })
@@ -1309,18 +1413,18 @@ public class SettVPNNative {
     catch { }
 
     $Script:connectScript = @'
-if (-not $Sync.Servers -or $Sync.Servers.Count -eq 0) { $Sync.StatusText = "Refresh the list first"; return }
+if (-not $Sync.Servers -or $Sync.Servers.Count -eq 0) { $Sync.StatusText = T 'Refresh the list first'; return }
 # Amostra espalhada: os de menor ping sao CDN/Cloudflare com caminho morto.
 $cands = @(Get-SpreadSample -Items @($Sync.Servers) -Max 12)
 $tries = 0
 foreach ($cfg in $cands) {
     $tries++
-    $Sync.StatusText = "Connecting ($tries/$($cands.Count)): $(Get-ShortName $cfg.Name)"
-    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.ExitIp = $Script:ExitIp; $Sync.StatusText = "Connected: $(Get-ShortName $cfg.Name)"; return }
+    $Sync.StatusText = (T 'Connecting ({0}/{1}): {2}') -f $tries, $cands.Count, (Get-ShortName $cfg.Name)
+    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.ExitIp = $Script:ExitIp; $Sync.StatusText = (T 'Connected: {0}') -f (Get-ShortName $cfg.Name); return }
 }
 $Sync.ConnectedConfig = $null
 $Sync.ExitIp = ""
-$Sync.StatusText = if ($Script:LastFailReason) { "Failed after $($tries): $($Script:LastFailReason)" } else { "Failed on $tries servers - click REFRESH" }
+$Sync.StatusText = if ($Script:LastFailReason) { (T 'Failed after {0}: {1}') -f $tries, $Script:LastFailReason } else { (T 'Failed on {0} servers - click REFRESH') -f $tries }
 '@
 
     $Script:reconnectScript = @'
@@ -1330,23 +1434,23 @@ $pool = @($Sync.Servers | Where-Object { $k = "$($_.Host):$($_.Port)"; -not ($Ba
 $pool = @($pool | Sort-Object -Property @{ Expression = { [int]$_.Ping } })
 if ($pool.Count -gt 0) {
     foreach ($cfg in $pool) {
-        $Sync.StatusText = "Trying: $(Get-ShortName $cfg.Name) ($($cfg.Ping)ms)"
-        if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.ExitIp = $Script:ExitIp; $Sync.StatusText = "Connected: $(Get-ShortName $cfg.Name)"; return }
+        $Sync.StatusText = (T 'Trying: {0} ({1}ms)') -f (Get-ShortName $cfg.Name), $cfg.Ping
+        if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.ExitIp = $Script:ExitIp; $Sync.StatusText = (T 'Connected: {0}') -f (Get-ShortName $cfg.Name); return }
     }
 }
 
 # Fallback: pool esgotado -> refaz do mesmo modo (filtrado ou nao)
-$Sync.StatusText = "Pool exhausted - rebuilding..."
+$Sync.StatusText = T 'Pool exhausted - rebuilding...'
 $candidates = Get-ServerPool -Filtered $Sync.Filtered -BadServers $BadServers
-if (-not $candidates -or $candidates.Count -eq 0) { $Sync.ConnectedConfig = $null; $Sync.StatusText = "No servers found"; return }
+if (-not $candidates -or $candidates.Count -eq 0) { $Sync.ConnectedConfig = $null; $Sync.StatusText = T 'No servers found'; return }
 $Sync.Servers = $candidates
 foreach ($cfg in $candidates) {
-    $Sync.StatusText = "Trying: $(Get-ShortName $cfg.Name) ($($cfg.Ping)ms)"
-    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.ExitIp = $Script:ExitIp; $Sync.StatusText = "Connected: $(Get-ShortName $cfg.Name)"; return }
+    $Sync.StatusText = (T 'Trying: {0} ({1}ms)') -f (Get-ShortName $cfg.Name), $cfg.Ping
+    if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.ExitIp = $Script:ExitIp; $Sync.StatusText = (T 'Connected: {0}') -f (Get-ShortName $cfg.Name); return }
 }
 $Sync.ConnectedConfig = $null
 $Sync.ExitIp = ""
-$Sync.StatusText = if ($Script:LastFailReason) { "All failed: $Script:LastFailReason" } else { "All servers failed" }
+$Sync.StatusText = if ($Script:LastFailReason) { (T 'All failed: {0}') -f $Script:LastFailReason } else { T 'All servers failed' }
 '@
 
     $Script:refreshScript = @'
@@ -1354,50 +1458,50 @@ $Sync.StatusText = if ($Script:LastFailReason) { "All failed: $Script:LastFailRe
 # a lista que chega na tela so tem servidor que realmente passa trafego.
 $pool = Get-ServerPool -Filtered $true -BadServers $BadServers
 $Sync.Filtered = $true
-if (-not $pool -or $pool.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = "No working servers"; return }
+if (-not $pool -or $pool.Count -eq 0) { $Sync.Servers = @(); $Sync.StatusText = T 'No working servers'; return }
 $Sync.Servers = $pool
-$Sync.StatusText = "Working servers: $($pool.Count)"
+$Sync.StatusText = (T 'Working servers: {0}') -f $pool.Count
 '@
 
     $Script:connectSelectedScript = @'
 $idx = $Sync.SelectedIndex
-if ($idx -lt 0 -or $idx -ge $Sync.Servers.Count) { $Sync.StatusText = "No server selected"; return }
+if ($idx -lt 0 -or $idx -ge $Sync.Servers.Count) { $Sync.StatusText = T 'No server selected'; return }
 $cfg = $Sync.Servers[$idx]
-$Sync.StatusText = "Connecting: $(Get-ShortName $cfg.Name)"
-if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.ExitIp = $Script:ExitIp; $Sync.StatusText = "Connected: $(Get-ShortName $cfg.Name)" }
-else { $Sync.ConnectedConfig = $null; $Sync.ExitIp = ""; $Sync.StatusText = if ($Script:LastFailReason) { $Script:LastFailReason } else { "Failed to connect to $(Get-ShortName $cfg.Name)" } }
+$Sync.StatusText = (T 'Connecting: {0}') -f (Get-ShortName $cfg.Name)
+if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) { $Sync.ConnectedConfig = $cfg; $Sync.ExitIp = $Script:ExitIp; $Sync.StatusText = (T 'Connected: {0}') -f (Get-ShortName $cfg.Name) }
+else { $Sync.ConnectedConfig = $null; $Sync.ExitIp = ""; $Sync.StatusText = if ($Script:LastFailReason) { $Script:LastFailReason } else { (T 'Failed to connect to {0}') -f (Get-ShortName $cfg.Name) } }
 '@
 
     $Script:tunToggleScript = @'
 $cfg = $Sync.ConnectedConfig
 if (-not $cfg) {
-    $Sync.StatusText = if ($Sync.TunEnabled) { "TUN mode on (applies on connect)" } else { "TUN mode off" }
+    $Sync.StatusText = if ($Sync.TunEnabled) { T 'TUN mode on (applies on connect)' } else { T 'TUN mode off' }
     return
 }
-$Sync.StatusText = if ($Sync.TunEnabled) { "Reconnecting with TUN..." } else { "Reconnecting without TUN..." }
+$Sync.StatusText = if ($Sync.TunEnabled) { T 'Reconnecting with TUN...' } else { T 'Reconnecting without TUN...' }
 if (Start-V2Ray -Config $cfg -Tun:([bool]$Sync.TunEnabled)) {
     $Sync.ConnectedConfig = $cfg
     $Sync.ExitIp = $Script:ExitIp
-    $Sync.StatusText = if ($Sync.TunEnabled) { "Connected (TUN ON)" } else { "Connected (TUN OFF)" }
+    $Sync.StatusText = if ($Sync.TunEnabled) { T 'Connected (TUN ON)' } else { T 'Connected (TUN OFF)' }
 }
 else {
     $Sync.ConnectedConfig = $null
     $Sync.ExitIp = ""
-    $Sync.StatusText = if ($Script:LastFailReason) { "Reconnect failed: $Script:LastFailReason" } else { "Reconnect failed with TUN mode" }
+    $Sync.StatusText = if ($Script:LastFailReason) { (T 'Reconnect failed: {0}') -f $Script:LastFailReason } else { T 'Reconnect failed with TUN mode' }
 }
 '@
 
     $Script:GuiBtnConnect.Add_Click({
         $Script:GuiLblLog.Text = "Connecting..."
-        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog "System proxy re-enabled on connect" "INFO" }
-        Add-GuiLog "Connecting (trying servers)..." "INFO"
+        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog (T 'System proxy re-enabled on connect') "INFO" }
+        Add-GuiLog (T 'Connecting (trying servers)...') "INFO"
         Invoke-Background -OpScript $Script:connectScript -OnComplete {
             Update-GuiStatus; Populate-ServerList
             if ($Script:GuiSync.ConnectedConfig) {
-                Add-GuiLog "Connected: $($Script:GuiSync.ConnectedConfig.Name)" "OK"
+                Add-GuiLog ((T 'Connected: {0}') -f $Script:GuiSync.ConnectedConfig.Name) "OK"
             }
             else {
-                Add-GuiLog "Failed: $($Script:GuiSync.StatusText)" "ERROR"
+                Add-GuiLog ((T 'Failed: {0}') -f $Script:GuiSync.StatusText) "ERROR"
             }
         }
     })
@@ -1409,43 +1513,43 @@ else {
         $Script:GuiSync.ScanTested = 0
         $Script:GuiSync.ScanStart = [DateTime]::MinValue
         $Script:GuiSync.ScanDeadline = [DateTime]::MinValue
-        Add-GuiLog "Downloading list and testing (TCP+UDP)..." "INFO"
+        Add-GuiLog (T 'Downloading list and testing (TCP+UDP)...') "INFO"
         Invoke-Background -OpScript $Script:refreshScript -OnComplete {
             Populate-ServerList
             $Script:ListReady = $true
             Set-GuiBusy $false
-            Add-GuiLog "$($Script:GuiSync.Servers.Count) working servers" "OK"
+            Add-GuiLog ((T '{0} working servers') -f $Script:GuiSync.Servers.Count) "OK"
         }
     })
 
     $Script:GuiBtnConnectSelected.Add_Click({
         $idx = $Script:GuiLstServers.SelectedIndex
-        if ($idx -lt 0 -or $idx -ge @($Script:VisibleServers).Count) { $Script:GuiLblLog.Text = "Select a server in the list"; return }
+        if ($idx -lt 0 -or $idx -ge @($Script:VisibleServers).Count) { $Script:GuiLblLog.Text = T 'Select a server in the list'; return }
         $cfg = $Script:VisibleServers[$idx]
         $Script:GuiSync.SelectedIndex = [array]::IndexOf(@($Script:GuiSync.Servers), $cfg)
-        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog "System proxy re-enabled on connect" "INFO" }
-        Add-GuiLog "Connecting: $($cfg.Name)" "INFO"
+        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog (T 'System proxy re-enabled on connect') "INFO" }
+        Add-GuiLog ((T 'Connecting: {0}') -f $cfg.Name) "INFO"
         Invoke-Background -OpScript $Script:connectSelectedScript -OnComplete {
             Update-GuiStatus
             if ($Script:GuiSync.ConnectedConfig) {
-                Add-GuiLog "Connected: $($Script:GuiSync.ConnectedConfig.Name)" "OK"
+                Add-GuiLog ((T 'Connected: {0}') -f $Script:GuiSync.ConnectedConfig.Name) "OK"
             }
             else {
-                Add-GuiLog "Failed: $($Script:GuiSync.StatusText)" "ERROR"
+                Add-GuiLog ((T 'Failed: {0}') -f $Script:GuiSync.StatusText) "ERROR"
             }
         }
     })
 
     $Script:GuiBtnDisconnect.Add_Click({
-        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog "System proxy disabled" "WARN" }
-        if ($Script:GuiSync.TunEnabled) { $Script:GuiSync.TunEnabled = $false; Update-TunButton; Add-GuiLog "TUN mode off" "WARN" }
-        if ($Script:GuiSync.KillSwitch) { $Script:GuiSync.KillSwitch = $false; Update-KsButton; Add-GuiLog "Kill switch off" "WARN" }
+        if ($Script:ProxyActive) { Disable-SystemProxy; Update-ProxyButton; Add-GuiLog (T 'System proxy disabled') "WARN" }
+        if ($Script:GuiSync.TunEnabled) { $Script:GuiSync.TunEnabled = $false; Update-TunButton; Add-GuiLog (T 'TUN mode off') "WARN" }
+        if ($Script:GuiSync.KillSwitch) { $Script:GuiSync.KillSwitch = $false; Update-KsButton; Add-GuiLog (T 'Kill switch off') "WARN" }
         Stop-V2Ray
         $Script:GuiSync.ConnectedConfig = $null
         $Script:GuiSync.ExitIp = ""
         Update-GuiStatus
-        $Script:GuiLblLog.Text = "Disconnected"
-        Add-GuiLog "Disconnected" "WARN"
+        $Script:GuiLblLog.Text = T 'state:Disconnected'
+        Add-GuiLog (T 'state:Disconnected') "WARN"
     })
 
     $Script:GuiBtnProxy.Add_Click({
@@ -1453,27 +1557,27 @@ else {
         if ($Script:ProxyActive) {
             Disable-SystemProxy
             Update-ProxyButton
-            Add-GuiLog "System proxy disabled" "WARN"
+            Add-GuiLog (T 'System proxy disabled') "WARN"
         }
         else {
             if ($Script:GuiSync.TunEnabled) {
                 $Script:GuiSync.TunEnabled = $false
                 Update-TunButton
-                Add-GuiLog "TUN mode off (proxy active)" "WARN"
+                Add-GuiLog (T 'TUN mode off (proxy active)') "WARN"
             }
             if ($Script:GuiSync.KillSwitch) {
                 $Script:GuiSync.KillSwitch = $false
                 Update-KsButton
-                Add-GuiLog "Kill switch off (requires TUN mode)" "WARN"
+                Add-GuiLog (T 'Kill switch off (requires TUN mode)') "WARN"
             }
             if (-not (Enable-SystemProxy)) {
                 Update-ProxyButton
-                Add-GuiLog "System proxy not enabled: connect first" "ERROR"
+                Add-GuiLog (T 'System proxy not enabled: connect first') "ERROR"
                 return
             }
             Update-ProxyButton
-            Add-GuiLog "System proxy enabled (HTTP 127.0.0.1:$($Script:HttpPort))" "OK"
-            Add-GuiLog "Discord voice (UDP) bypasses the proxy - use TUN mode" "WARN"
+            Add-GuiLog ((T 'System proxy enabled (HTTP 127.0.0.1:{0})') -f $Script:HttpPort) "OK"
+            Add-GuiLog (T 'Discord voice (UDP) bypasses the proxy - use TUN mode') "WARN"
             if ($Script:GuiSync.ConnectedConfig) {
                 Invoke-Background -OpScript $Script:tunToggleScript -OnComplete { Update-GuiStatus }
             }
@@ -1492,17 +1596,17 @@ else {
             if ($Script:ProxyActive) {
                 Disable-SystemProxy
                 Update-ProxyButton
-                Add-GuiLog "Proxy off (TUN covers the whole network)" "WARN"
+                Add-GuiLog (T 'Proxy off (TUN covers the whole network)') "WARN"
             }
-            Add-GuiLog "TUN mode on - routes the whole network (requires admin)" "OK"
+            Add-GuiLog (T 'TUN mode on - routes the whole network (requires admin)') "OK"
         }
         else {
-            Add-GuiLog "TUN mode off" "WARN"
+            Add-GuiLog (T 'TUN mode off') "WARN"
         }
         Invoke-Background -OpScript $Script:tunToggleScript -OnComplete {
             Update-GuiStatus
             if ($Script:GuiSync.ConnectedConfig) {
-                Add-GuiLog "Connected (TUN $(if ($Script:GuiSync.TunEnabled) { 'ON' } else { 'OFF' }))" "OK"
+                Add-GuiLog ((T 'Connected (TUN {0})') -f $(if ($Script:GuiSync.TunEnabled) { 'ON' } else { 'OFF' })) "OK"
             }
         }
     })
@@ -1510,15 +1614,15 @@ else {
     $Script:GuiBtnKs.Add_Click({
         if (-not $Script:GuiSync.KillSwitch) {
             if (-not $Script:GuiSync.TunEnabled) {
-                Add-GuiLog "Kill switch requires TUN mode (turn on TUN first)" "WARN"
+                Add-GuiLog (T 'Kill switch requires TUN mode (turn on TUN first)') "WARN"
                 return
             }
             $Script:GuiSync.KillSwitch = $true
-            Add-GuiLog "Kill switch ON: all traffic outside the tunnel will be blocked" "WARN"
+            Add-GuiLog (T 'Kill switch ON: all traffic outside the tunnel will be blocked') "WARN"
         }
         else {
             $Script:GuiSync.KillSwitch = $false
-            Add-GuiLog "Kill switch OFF" "WARN"
+            Add-GuiLog (T 'state:Kill switch OFF') "WARN"
         }
         Update-KsButton
         if ($Script:GuiSync.ConnectedConfig) {
@@ -1527,10 +1631,37 @@ else {
                 $Script:GuiSync.KsActive = Test-KillSwitchActive
                 Update-KsButton
                 if ($Script:GuiSync.KillSwitch -and -not $Script:GuiSync.KsActive) {
-                    Add-GuiLog "Kill switch NOT applied - see the log (killswitch)" "ERROR"
+                    Add-GuiLog (T 'Kill switch NOT applied - see the log (killswitch)') "ERROR"
                 }
             }
         }
+    })
+
+    $Script:GuiBtnStartMin.Add_Click({
+        $Script:AppSettings.StartMinimized = -not [bool]$Script:AppSettings.StartMinimized
+        Save-AppSettings $Script:AppSettings
+        Update-StartMinButton
+    })
+
+    $Script:GuiBtnStartWin.Add_Click({
+        $want = -not [bool]$Script:AppSettings.StartWithWindows
+        if (-not (Set-AutoStart -Enabled $want)) {
+            $Script:AppSettings.StartWithWindows = $false
+            Save-AppSettings $Script:AppSettings
+            Update-StartWinButton
+            Add-GuiLog (T 'Could not register the startup entry') "ERROR"
+            return
+        }
+        $Script:AppSettings.StartWithWindows = $want
+        Save-AppSettings $Script:AppSettings
+        Update-StartWinButton
+    })
+
+    $Script:GuiBtnLanguage.Add_Click({
+        $Script:Language = if ($Script:Language -eq 'pt') { 'en' } else { 'pt' }
+        $Script:AppSettings.Language = $Script:Language
+        Save-AppSettings $Script:AppSettings
+        Apply-Language
     })
 
     $Script:GuiBtnSplit.Add_Click({ Show-SplitDialog })
@@ -1547,7 +1678,7 @@ else {
             [void]$Script:GuiSettings.Activate()
         }
         catch {
-            Add-GuiLog "Failed to open settings: $_" "ERROR"
+            Add-GuiLog ((T 'Failed to open settings: {0}') -f $_) "ERROR"
         }
     })
 
@@ -1564,39 +1695,39 @@ else {
     $Script:GuiBtnSort.Add_Click({
         $Script:SortDesc = -not $Script:SortDesc
         $Script:GuiIcoSort.Text = if ($Script:SortDesc) { [char]0xE70D } else { [char]0xE70E }
-        $msg = if ($Script:SortDesc) { "Sorted by latency: highest first" } else { "Sorted by latency: lowest first" }
+        $msg = if ($Script:SortDesc) { T 'Sorted by latency: highest first' } else { T 'Sorted by latency: lowest first' }
         Add-GuiLog $msg "INFO"
         Populate-ServerList
     })
 
     $Script:GuiBtnInfoKs.Add_Click({
         [System.Windows.MessageBox]::Show(
-            "Kill switch`n`nBlocks ALL Windows outbound traffic (firewall profiles) except xray, the local proxy and the tunnel interface. If the VPN drops, nothing leaks to the internet.`n`nTUN mode only. Requires admin (UAC). On disconnect the firewall is restored; if the app is killed, the next start restores it (UAC).",
-            "Kill switch",
+            (T "Kill switch`n`nBlocks ALL Windows outbound traffic (firewall profiles) except xray, the local proxy and the tunnel interface. If the VPN drops, nothing leaks to the internet.`n`nTUN mode only. Requires admin (UAC). On disconnect the firewall is restored; if the app is killed, the next start restores it (UAC)."),
+            (T 'Kill switch'),
             [System.Windows.MessageBoxButton]::OK,
             [System.Windows.MessageBoxImage]::Warning)
     })
 
     $Script:GuiBtnInfoSplit.Add_Click({
         [System.Windows.MessageBox]::Show(
-            "Split tunneling`n`nListed domains and IPs/CIDRs go DIRECT (outside the VPN). Use it for banks, games, sites that block VPNs or your local network.`n`nExamples: netflix.com / 10.0.0.0/8. TUN mode only; applies on reconnect.",
-            "Split tunneling",
+            (T "Split tunneling`n`nListed domains and IPs/CIDRs go DIRECT (outside the VPN). Use it for banks, games, sites that block VPNs or your local network.`n`nExamples: netflix.com / 10.0.0.0/8. TUN mode only; applies on reconnect."),
+            (T 'Split tunneling'),
             [System.Windows.MessageBoxButton]::OK,
             [System.Windows.MessageBoxImage]::Information)
     })
 
     $Script:GuiBtnInfoProxy.Add_Click({
         [System.Windows.MessageBox]::Show(
-            "System proxy`n`nConfigures the Windows HTTP proxy (HTTP and HTTPS leave via 127.0.0.1). Only apps that respect the system proxy go through the VPN (browser, Discord text/API).`n`nApps using UDP/WebRTC (Discord voice, games) IGNORE the proxy and go direct. To route everything, use TUN mode.",
-            "System proxy",
+            (T "System proxy`n`nConfigures the Windows HTTP proxy (HTTP and HTTPS leave via 127.0.0.1). Only apps that respect the system proxy go through the VPN (browser, Discord text/API).`n`nApps using UDP/WebRTC (Discord voice, games) IGNORE the proxy and go direct. To route everything, use TUN mode."),
+            (T 'System proxy'),
             [System.Windows.MessageBoxButton]::OK,
             [System.Windows.MessageBoxImage]::Information)
     })
 
     $Script:GuiBtnInfoTun.Add_Click({
         [System.Windows.MessageBox]::Show(
-            "TUN mode`n`nCreates a virtual network adapter and routes ALL system traffic through the VPN - including Discord voice (UDP/WebRTC), games and apps that ignore proxies.`n`nDifference: the system proxy only covers apps that respect it; TUN covers everything.`n`nRequires running as administrator.",
-            "TUN mode",
+            (T "TUN mode`n`nCreates a virtual network adapter and routes ALL system traffic through the VPN - including Discord voice (UDP/WebRTC), games and apps that ignore proxies.`n`nDifference: the system proxy only covers apps that respect it; TUN covers everything.`n`nRequires running as administrator."),
+            (T 'TUN mode'),
             [System.Windows.MessageBoxButton]::OK,
             [System.Windows.MessageBoxImage]::Information)
     })
@@ -1606,10 +1737,10 @@ else {
             $text = (@($Script:GuiLstLog.Items) | ForEach-Object { [string]$_.Content }) -join "`r`n"
             if (-not $text) { $text = [string]$Script:GuiLblLog.Text }
             [System.Windows.Clipboard]::SetText($text)
-            $Script:GuiLblLog.Text = "Activity copied ($($Script:GuiLstLog.Items.Count) lines)"
+            $Script:GuiLblLog.Text = (T 'Activity copied ({0} lines)') -f $Script:GuiLstLog.Items.Count
         }
         catch {
-            $Script:GuiLblLog.Text = "Copy failed: $($_.Exception.Message)"
+            $Script:GuiLblLog.Text = (T 'Copy failed: {0}') -f $_.Exception.Message
         }
     })
 
@@ -1622,7 +1753,7 @@ else {
             $Script:GuiWindow.Hide()
             $Script:GuiWindow.ShowInTaskbar = $false
             if ($Script:TrayIcon) {
-                $Script:TrayIcon.ShowBalloonTip(3000, "SETT VPN", "Still running in the tray. Use Exit in the tray menu to quit.", [System.Windows.Forms.ToolTipIcon]::Info)
+                $Script:TrayIcon.ShowBalloonTip(3000, "SETT VPN", (T 'Still running in the tray. Use Exit in the tray menu to quit.'), [System.Windows.Forms.ToolTipIcon]::Info)
             }
         }
     })
@@ -1647,12 +1778,11 @@ else {
                 $total = [int]$Script:GuiSync.ScanTotal
                 if ($p -gt 0 -and $p -lt 100 -and $total -gt 0) {
                     $remaining = Get-ScanRemainingSeconds -Deadline $Script:GuiSync.ScanDeadline
-                    $txt = "$p%"
                     if ($remaining -ge 60) {
-                        $txt += " - ~$([int]($remaining/60))m$($remaining % 60)s left"
+                        $txt = (T '{0}% - ~{1}m{2}s left') -f $p, [int]($remaining / 60), ($remaining % 60)
                     }
                     else {
-                        $txt += " - ~${remaining}s left"
+                        $txt = (T '{0}% - ~{1}s left') -f $p, $remaining
                     }
                     $Script:GuiLblProgress.Text = $txt
                 }
@@ -1707,11 +1837,11 @@ else {
         }
         if ($Script:GuiLblKs) {
             if ($Script:GuiSync.KsActive) {
-                $Script:GuiLblKs.Text = "ACTIVE - nothing leaks outside the tunnel"
+                $Script:GuiLblKs.Text = T 'ACTIVE - nothing leaks outside the tunnel'
                 $Script:GuiLblKs.Foreground = $Script:BrushGreen
             }
             else {
-                $Script:GuiLblKs.Text = "blocks everything outside the tunnel · TUN only"
+                $Script:GuiLblKs.Text = T 'blocks everything outside the tunnel · TUN only'
                 $Script:GuiLblKs.Foreground = $Script:BrushMuted
             }
         }
@@ -1730,15 +1860,15 @@ else {
                 $Script:GuiSync.ConnectedConfig = $null
                 $Script:GuiSync.ExitIp = ""
                 Update-GuiStatus
-                Add-GuiLog "TUNNEL DROPPED - reconnecting..." "ERROR"
+                Add-GuiLog (T 'TUNNEL DROPPED - reconnecting...') "ERROR"
                 Show-GuiWindow
                 Invoke-Background -OpScript $Script:reconnectScript -OnComplete {
                     Update-GuiStatus; Populate-ServerList
                     if ($Script:GuiSync.ConnectedConfig) {
-                        Add-GuiLog "Reconnected: $($Script:GuiSync.ConnectedConfig.Name)" "OK"
+                        Add-GuiLog ((T 'Reconnected: {0}') -f $Script:GuiSync.ConnectedConfig.Name) "OK"
                     }
                     else {
-                        Add-GuiLog "Reconnect failed" "ERROR"
+                        Add-GuiLog (T 'Reconnect failed') "ERROR"
                     }
                 }
             }
@@ -1771,12 +1901,17 @@ else {
     Update-ProxyButton
     Update-TunButton
     Update-KsButton
-    Update-SplitLabel
     Set-GuiBusy $false
-    Add-GuiLog "Ready. Refresh the server list." "INFO"
+    Apply-Language
+    Add-GuiLog (T 'Ready. Refresh the server list.') "INFO"
 
     $Script:MainFrame = New-Object System.Windows.Threading.DispatcherFrame
     $Script:GuiWindow.Show()
+    if ($Script:AppSettings.StartMinimized) {
+        # Abre sem janela; o icone da bandeja (ou abrir o exe de novo) traz de volta.
+        $Script:GuiWindow.Hide()
+        $Script:GuiWindow.ShowInTaskbar = $false
+    }
 
     # Força o ícone nativo da janela (barra de tarefas) via WM_SETICON
     try {
