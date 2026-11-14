@@ -381,22 +381,56 @@ function Get-AutoStartCommand {
     return '"' + $exe + '"'
 }
 
+function Test-AutoStartTask {
+    param([string]$TaskName = 'SettVPN')
+    if (-not $TaskName) { return $false }
+    & schtasks /query /tn $TaskName 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
 function Set-AutoStart {
-    param([bool]$Enabled, [string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')
+    param([bool]$Enabled, [string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run', [string]$TaskName = 'SettVPN')
 
     if (-not $Enabled) {
+        if ($TaskName) {
+            try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop }
+            catch { & schtasks /delete /tn $TaskName /f 2>$null | Out-Null }
+        }
         Remove-ItemProperty -Path $RunKey -Name 'SettVPN' -ErrorAction SilentlyContinue
         return $true
     }
+
     $cmd = Get-AutoStartCommand
     if (-not $cmd) { return $false }
+
+    # Tarefa agendada com privilegio maximo: no login o Windows inicia o exe
+    # elevado sem prompt de UAC (conta admin). A tarefa tem que existir ANTES
+    # do login, por isso fica gravada ate o toggle ser desligado.
+    # Register-ScheduledTask (e nao schtasks /tr) para manter o caminho entre
+    # aspas: "D:\01 - Works\..." sem aspas vira "D:\01" e falha no logon.
+    if ($TaskName) {
+        try {
+            $exe = $cmd.Trim('"')
+            $action = New-ScheduledTaskAction -Execute $exe
+            $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+            $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+            $taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
+                -Settings $taskSettings -Force -ErrorAction Stop | Out-Null
+            if (Test-AutoStartTask -TaskName $TaskName) { return $true }
+        }
+        catch { }
+    }
+
+    # Fallback: Run key. Em maquina com politica padrao o login pede UAC.
     if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
     Set-ItemProperty -Path $RunKey -Name 'SettVPN' -Value $cmd
     return $true
 }
 
 function Test-AutoStart {
-    param([string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')
+    param([string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run', [string]$TaskName = 'SettVPN')
+    if (Test-AutoStartTask -TaskName $TaskName) { return $true }
     return $null -ne (Get-ItemProperty -Path $RunKey -Name 'SettVPN' -ErrorAction SilentlyContinue)
 }
 

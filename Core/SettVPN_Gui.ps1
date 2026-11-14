@@ -710,6 +710,13 @@ function Start-SettVPN-Gui {
     $Script:AppSettings = Get-AppSettings
     $Script:Language = [string]$Script:AppSettings.Language
 
+    # Configuracao manual pode ter mudado fora do app (tarefa removida, etc).
+    $autoNow = Test-AutoStart
+    if ($autoNow -ne [bool]$Script:AppSettings.StartWithWindows) {
+        $Script:AppSettings.StartWithWindows = $autoNow
+        Save-AppSettings $Script:AppSettings
+    }
+
     if (-not ("SettVPNNative" -as [type])) {
         Add-Type -TypeDefinition @"
 using System;

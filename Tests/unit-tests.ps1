@@ -107,10 +107,11 @@ $Script:Language = 'en'
 Assert-Equal (T 'CONECTAR') 'CONNECT' 'T: volta ao ingles'
 
 $testKey = 'HKCU:\Software\SettVPN-Test'
-Assert-True (Set-AutoStart -Enabled $true -RunKey $testKey) 'Autostart: grava entrada'
-Assert-True (Test-AutoStart -RunKey $testKey) 'Autostart: detecta entrada'
-Assert-True (Set-AutoStart -Enabled $false -RunKey $testKey) 'Autostart: remove entrada'
-Assert-True (-not (Test-AutoStart -RunKey $testKey)) 'Autostart: entrada removida'
+Assert-True (Set-AutoStart -Enabled $true -RunKey $testKey -TaskName '') 'Autostart: grava entrada'
+Assert-True (Test-AutoStart -RunKey $testKey -TaskName '') 'Autostart: detecta entrada'
+Assert-True (Set-AutoStart -Enabled $false -RunKey $testKey -TaskName '') 'Autostart: remove entrada'
+Assert-True (-not (Test-AutoStart -RunKey $testKey -TaskName '')) 'Autostart: entrada removida'
+Assert-True ((Get-AutoStartCommand) -match '\.exe"?$') 'Autostart: comando aponta para um exe'
 Remove-Item $testKey -Recurse -Force -ErrorAction SilentlyContinue
 
 # Servidores de menor ping (CDN) costumam estar mortos: amostra precisa se espalhar.

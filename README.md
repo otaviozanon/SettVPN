@@ -26,7 +26,7 @@
 | :-------------------- | :------------------------------------------------------------------------------- |
 | **One-click connect** | picks the fastest server that passed the stability test                          |
 | **English / Português** | interface language, switchable in Settings and remembered                      |
-| **Start options**     | launch minimized to the tray, and/or start with Windows                          |
+| **Start options**     | launch minimized to the tray, and/or start with Windows (scheduled task, no UAC prompt for admin accounts) |
 | **Real latency**      | measured through the tunnel (HTTP 204), not a TCP handshake to the server        |
 | **Live list only**    | dead servers never make it to the list                                           |
 | **Auto-reconnect**    | reconnects when the tunnel drops; restores proxy and firewall on exit            |
