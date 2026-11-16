@@ -541,6 +541,9 @@ Assert-True ($guiSrc -match 'x:Name="btnSort"' -and $guiSrc -match 'SortDesc') '
 Assert-True ($guiSrc -notmatch 'x:Name="btnFilter"') 'GUI: sem botao TESTAR (ATUALIZAR ja testa)'
 Assert-True ($guiSrc -match 'function Sync-SystemProxy' -and $guiSrc -match '(?m)^\s+Sync-SystemProxy\s*$') 'GUI: proxy do sistema liga sozinho ao conectar'
 Assert-True ($guiSrc -match 'function Invoke-CheckForUpdates' -and $guiSrc -match 'if \(Invoke-CheckForUpdates\)') 'GUI: checa atualizacao no GitHub ao abrir'
+Assert-True ($guiSrc -match 'Add_ContentRendered\(\{ Invoke-PendingUpdateDownload \}\)') 'GUI: atualizador sem closure (T resolve no exe)'
+Assert-True ($guiSrc -match 'x:Name="lblVersion"') 'GUI: versao no header'
+Assert-True ($guiSrc -notmatch "menu:Open") 'GUI: tray sem chaves menu: cruas'
 
 Write-Host "`n== Kill switch: script elevado ==" -ForegroundColor Cyan
 

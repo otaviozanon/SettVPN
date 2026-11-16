@@ -256,7 +256,10 @@ function Apply-Language {
 
     if ($Script:TrayMenu) {
         foreach ($k in @('Open', 'Connect', 'Disconnect', 'Tun', 'Exit')) {
-            if ($Script:TrayMenu.ContainsKey($k)) { $Script:TrayMenu[$k].Text = T $Script:TrayMenuText[$k] }
+            if ($Script:TrayMenu.ContainsKey($k)) {
+                $label = $Script:TrayMenuText[$k]
+                $Script:TrayMenu[$k].Text = if ($Script:Language -eq 'pt') { $label['pt'] } else { $label['en'] }
+            }
         }
     }
 }
@@ -854,6 +857,66 @@ Remove-Item -LiteralPath '$qNew' -Force -ErrorAction SilentlyContinue
 "@
 }
 
+function Invoke-PendingUpdateDownload {
+    # Roda no ContentRendered. Precisa ser uma funcao do script: o closure
+    # (GetNewClosure) do evento nao enxerga T/Add-GuiLog quando o exe roda pelo
+    # launcher, entao o ShowDialog estourava com "T is not recognized".
+    $job = $Script:PendingUpdate
+    if (-not $job) { return }
+
+    $progress = $job.Progress
+    $newExe = $job.NewExe
+    $expectedHash = [string]$job.ExpectedHash
+    $ok = $false; $reason = ''
+    for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
+        try {
+            $wc = New-Object System.Net.WebClient
+            try { $wc.DownloadFile([Uri]$job.Url, $newExe) } finally { $wc.Dispose() }
+            $got = (Get-Item -LiteralPath $newExe -ErrorAction Stop).Length
+            if ([long]$job.ExpectedSize -gt 0 -and $got -ne [long]$job.ExpectedSize) {
+                throw "incomplete download ($got / $($job.ExpectedSize) bytes)"
+            }
+            # Asset errado (release mal publicado) nao pode substituir o exe em uso.
+            $fileVer = [string]([System.Diagnostics.FileVersionInfo]::GetVersionInfo($newExe).ProductVersion)
+            $m = [regex]::Match($fileVer, '^\d+\.\d+\.\d+')
+            if (-not $m.Success -or $m.Value -ne [string]$job.NewVersion) { throw "version mismatch ($fileVer)" }
+            if ($expectedHash) {
+                $actual = (Get-FileHash -LiteralPath $newExe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+                if ($actual -ne $expectedHash) { throw 'SHA-256 mismatch' }
+                Add-GuiLog (T 'Update: SHA-256 verified') 'OK'
+            }
+            $ok = $true
+        }
+        catch {
+            $reason = $_.Exception.Message
+            Add-GuiLog ((T 'Update download failed: {0}') -f $reason) 'WARN'
+            Remove-Item -LiteralPath $newExe -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 600
+        }
+    }
+    if (-not $ok) {
+        Add-GuiLog ((T 'Update download failed: {0}') -f $reason) 'ERROR'
+        $progress.Close()
+        return
+    }
+
+    $job.Status.Text = T 'Restarting SETT VPN...'
+    try {
+        $logPath = Join-Path $Script:TempDir 'updater.log'
+        $updaterScript = Get-SelfUpdaterScript -NewExe $newExe -CurrentExe ([string]$job.CurrentExe) `
+            -LogPath $logPath -WaitPid ([System.Diagnostics.Process]::GetCurrentProcess().Id) -ExpectedHash $expectedHash
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($updaterScript))
+        Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-EncodedCommand', $encoded
+        ) | Out-Null
+        $job.State.Launched = $true
+    }
+    catch {
+        Add-GuiLog ((T 'Self-update failed: {0}') -f $_) 'ERROR'
+    }
+    $progress.Close()
+}
+
 function Invoke-SelfUpdate {
     param([string]$DownloadUrl, [string]$NewVersion, [long]$ExpectedSize = 0, [string]$ExpectedSha256 = "")
 
@@ -882,59 +945,22 @@ function Invoke-SelfUpdate {
     $state = @{ Launched = $false }
 
     # Baixa depois que o popup renderizou; DownloadFile e sincrono (async abortava no host 5.1).
-    $progress.Add_ContentRendered({
-        $ok = $false; $reason = ''
-        for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
-            try {
-                $wc = New-Object System.Net.WebClient
-                try { $wc.DownloadFile([Uri]$DownloadUrl, $newExe) } finally { $wc.Dispose() }
-                $got = (Get-Item -LiteralPath $newExe -ErrorAction Stop).Length
-                if ($ExpectedSize -gt 0 -and $got -ne $ExpectedSize) {
-                    throw "incomplete download ($got / $ExpectedSize bytes)"
-                }
-                # Asset errado (release mal publicado) nao pode substituir o exe em uso.
-                $fileVer = [string]([System.Diagnostics.FileVersionInfo]::GetVersionInfo($newExe).ProductVersion)
-                $m = [regex]::Match($fileVer, '^\d+\.\d+\.\d+')
-                if (-not $m.Success -or $m.Value -ne $NewVersion) { throw "version mismatch ($fileVer)" }
-                if ($expectedHash) {
-                    $actual = (Get-FileHash -LiteralPath $newExe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
-                    if ($actual -ne $expectedHash) { throw 'SHA-256 mismatch' }
-                    Add-GuiLog (T 'Update: SHA-256 verified') 'OK'
-                }
-                $ok = $true
-            }
-            catch {
-                $reason = $_.Exception.Message
-                Add-GuiLog ((T 'Update download failed: {0}') -f $reason) 'WARN'
-                Remove-Item -LiteralPath $newExe -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 600
-            }
-        }
-        if (-not $ok) {
-            Add-GuiLog ((T 'Update download failed: {0}') -f $reason) 'ERROR'
-            $progress.Close()
-            return
-        }
-
-        $txtStatus.Text = T 'Restarting SETT VPN...'
-        try {
-            $logPath = Join-Path $Script:TempDir 'updater.log'
-            $currentPid = [System.Diagnostics.Process]::GetCurrentProcess().Id
-            $updaterScript = Get-SelfUpdaterScript -NewExe $newExe -CurrentExe $currentExe `
-                -LogPath $logPath -WaitPid $currentPid -ExpectedHash $expectedHash
-            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($updaterScript))
-            Start-Process -FilePath 'powershell.exe' -ArgumentList @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-EncodedCommand', $encoded
-            ) | Out-Null
-            $state.Launched = $true
-        }
-        catch {
-            Add-GuiLog ((T 'Self-update failed: {0}') -f $_) 'ERROR'
-        }
-        $progress.Close()
-    }.GetNewClosure())
+    # O handler chama uma funcao do script em vez de carregar o codigo num closure.
+    $Script:PendingUpdate = @{
+        Url          = $DownloadUrl
+        NewVersion   = $NewVersion
+        ExpectedSize = $ExpectedSize
+        ExpectedHash = $expectedHash
+        NewExe       = $newExe
+        CurrentExe   = $currentExe
+        State        = $state
+        Progress     = $progress
+        Status       = $txtStatus
+    }
+    $progress.Add_ContentRendered({ Invoke-PendingUpdateDownload })
 
     $progress.ShowDialog() | Out-Null
+    $Script:PendingUpdate = $null
     return [bool]$state.Launched
 }
 
@@ -984,6 +1010,10 @@ function Start-SettVPN-Gui {
 
     $Script:AppSettings = Get-AppSettings
     $Script:Language = [string]$Script:AppSettings.Language
+
+    # Versao exibida no header; "dev" quando roda direto do .ps1 (sem launcher).
+    $Script:AppVersion = Get-AppVersion
+    if (-not $Script:AppVersion) { $Script:AppVersion = 'dev' }
 
     # Configuracao manual pode ter mudado fora do app (tarefa removida, exe movido, etc).
     $autoNow = Test-AutoStart
@@ -1256,6 +1286,7 @@ public class SettVPNNative {
             <Border Width="54" Height="54" CornerRadius="27" Background="#1E1E22" BorderBrush="#2A2A30" BorderThickness="1" HorizontalAlignment="Center">
               <TextBlock Text="&#9889;" FontSize="22" Foreground="#D4AF37" HorizontalAlignment="Center" VerticalAlignment="Center"/>
             </Border>
+            <TextBlock x:Name="lblVersion" Text="v$Script:AppVersion" FontSize="10" Foreground="#5A5A64" HorizontalAlignment="Center" Margin="0,6,0,0"/>
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,12,0,0">
               <Ellipse x:Name="dotStatus" Width="8" Height="8" Fill="#DA3633" VerticalAlignment="Center" Margin="0,0,7,0"/>
               <TextBlock x:Name="lblStatus" Text="DISCONNECTED" FontSize="13" FontWeight="SemiBold" Foreground="#DA3633" VerticalAlignment="Center"/>
@@ -1664,7 +1695,13 @@ public class SettVPNNative {
     [void]$trayMenu.Items.Add($menuExit)
     $Script:TrayIcon.ContextMenuStrip = $trayMenu
     $Script:TrayMenu = @{ Open = $menuOpen; Connect = $menuConnect; Disconnect = $menuDisconnect; Tun = $menuTun; Exit = $menuExit }
-    $Script:TrayMenuText = @{ Open = 'menu:Open'; Connect = 'menu:Connect'; Disconnect = 'menu:Disconnect'; Tun = 'menu:TUN'; Exit = 'menu:Exit' }
+    $Script:TrayMenuText = @{
+        Open       = @{ en = 'Open';                pt = 'Abrir' }
+        Connect    = @{ en = 'Connect';             pt = 'Conectar' }
+        Disconnect = @{ en = 'Disconnect';          pt = 'Desconectar' }
+        Tun        = @{ en = 'TUN mode (on/off)';   pt = 'Modo TUN (liga/desliga)' }
+        Exit       = @{ en = 'Exit';                pt = 'Sair' }
+    }
     $Script:TrayIcon.Add_DoubleClick({
         Show-GuiWindow
     })
