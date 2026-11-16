@@ -700,6 +700,275 @@ public class SettVpnDwm {
     catch { }
 }
 
+# ============================================================
+# Atualizacao (GitHub releases)
+# ============================================================
+
+function New-UpdateWindow {
+    param([string]$Title, [string]$BodyXaml, [int]$Width = 440)
+
+    $xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$Title" Width="$Width" SizeToContent="Height"
+        WindowStartupLocation="CenterScreen" ShowInTaskbar="False"
+        Background="#141417" ResizeMode="NoResize" FontFamily="Segoe UI">
+  <Window.Resources>
+    <Style x:Key="Flat" TargetType="Button">
+      <Setter Property="Width" Value="92"/>
+      <Setter Property="Height" Value="32"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Background" Value="#1E1E22"/>
+      <Setter Property="Foreground" Value="#C5C5CC"/>
+      <Setter Property="BorderBrush" Value="#2A2A30"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1" CornerRadius="6">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#2A2A30"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="Gold" TargetType="Button">
+      <Setter Property="Width" Value="92"/>
+      <Setter Property="Height" Value="32"/>
+      <Setter Property="FontSize" Value="11"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Background" Value="#D4AF37"/>
+      <Setter Property="Foreground" Value="#141417"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="bd" Background="{TemplateBinding Background}" CornerRadius="6">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="bd" Property="Background" Value="#E0BE50"/></Trigger>
+              <Trigger Property="IsPressed" Value="True"><Setter TargetName="bd" Property="Background" Value="#B8962F"/></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <StackPanel Margin="20">
+    $BodyXaml
+  </StackPanel>
+</Window>
+"@
+    $reader = New-Object System.Xml.XmlNodeReader ([xml]$xaml)
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    # Barra de titulo no tema escuro do app (o XAML nao controla o chrome do Windows).
+    $window.Add_SourceInitialized({ param($s, $e) Set-DarkTitleBar $s })
+    return $window
+}
+
+function Get-UpdateConfirmBody {
+    param([string]$CurrentVersion, [string]$NewVersion)
+
+    return @"
+<TextBlock Text="$(T 'Update available')" Foreground="#EDEDEF" FontSize="14" FontWeight="Bold"/>
+<TextBlock Text="v$CurrentVersion &#8594; v$NewVersion" Foreground="#8A8A94" FontSize="11" Margin="0,3,0,0"/>
+<TextBlock Text="$(T 'A new version of SETT VPN is ready to install. Update now?')" Foreground="#C5C5CC" FontSize="12" TextWrapping="Wrap" Margin="0,14,0,18"/>
+<StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+  <Button x:Name="btnLater" Content="$(T 'Later')" Style="{StaticResource Flat}" Margin="0,0,8,0"/>
+  <Button x:Name="btnUpdate" Content="$(T 'Update now')" Style="{StaticResource Gold}" IsDefault="True"/>
+</StackPanel>
+"@
+}
+
+function Get-UpdateProgressBody {
+    param([string]$NewVersion)
+
+    return @"
+<TextBlock Text="$(T 'Downloading update...') v$NewVersion" Foreground="#EDEDEF" FontSize="14" FontWeight="Bold"/>
+<TextBlock x:Name="txtStatus" Text="$(T 'Downloading...')" Foreground="#8A8A94" FontSize="11" Margin="0,3,0,12"/>
+<ProgressBar Height="6" IsIndeterminate="True" Background="#1E1E22" Foreground="#D4AF37" BorderThickness="0"/>
+"@
+}
+
+function Show-UpdateConfirmDialog {
+    param([string]$CurrentVersion, [string]$NewVersion)
+
+    $body = Get-UpdateConfirmBody -CurrentVersion $CurrentVersion -NewVersion $NewVersion
+    $dlg = New-UpdateWindow -Title (T 'SETT VPN Update') -BodyXaml $body
+    $state = @{ Go = $false }
+    $dlg.FindName('btnLater').Add_Click({ $state.Go = $false; $dlg.Close() }.GetNewClosure())
+    $dlg.FindName('btnUpdate').Add_Click({ $state.Go = $true; $dlg.Close() }.GetNewClosure())
+    $dlg.ShowDialog() | Out-Null
+    return [bool]$state.Go
+}
+
+function Get-SelfUpdaterScript {
+    # Roda fora do app (depois que ele fecha) para trocar o exe em uso.
+    # -EncodedCommand: um .ps1 em pasta gravavel poderia ser trocado antes da execucao elevada.
+    param([string]$NewExe, [string]$CurrentExe, [string]$LogPath, [int]$WaitPid, [string]$ExpectedHash)
+
+    $qNew = $NewExe -replace "'", "''"
+    $qCur = $CurrentExe -replace "'", "''"
+    $qLog = $LogPath -replace "'", "''"
+
+    return @"
+`$ErrorActionPreference = 'Stop'
+function Write-UpdLog { param(`$m) try { Add-Content -Path '$qLog' -Value ((Get-Date -Format 'HH:mm:ss') + ' ' + `$m) -Encoding UTF8 } catch {} }
+try { Wait-Process -Id $WaitPid -Timeout 15 } catch {}
+Start-Sleep -Seconds 1
+if ('$ExpectedHash') {
+  try { `$srcHash = (Get-FileHash -LiteralPath '$qNew' -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
+  catch { Write-UpdLog ('SOURCE HASH ERROR: ' + `$_.Exception.Message); exit 1 }
+  if (`$srcHash -ne '$ExpectedHash') { Write-UpdLog 'SOURCE HASH MISMATCH - aborting'; exit 1 }
+}
+`$copied = `$false
+for (`$i = 0; `$i -lt 20 -and -not `$copied; `$i++) {
+  try {
+    Copy-Item -LiteralPath '$qNew' -Destination '$qCur' -Force -ErrorAction Stop
+    `$copied = `$true
+    Write-UpdLog 'COPY OK'
+  } catch {
+    Write-UpdLog ("COPY RETRY " + (`$i + 1) + ': ' + `$_.Exception.Message)
+    Start-Sleep -Milliseconds 500
+  }
+}
+if (-not `$copied) { Write-UpdLog 'COPY FAILED - aborting relaunch'; exit 1 }
+if ('$ExpectedHash') {
+  try { `$dstHash = (Get-FileHash -LiteralPath '$qCur' -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() }
+  catch { Write-UpdLog ('DEST HASH ERROR: ' + `$_.Exception.Message); exit 1 }
+  if (`$dstHash -ne '$ExpectedHash') { Write-UpdLog 'DEST HASH MISMATCH - aborting relaunch'; exit 1 }
+}
+try { Start-Process -FilePath '$qCur'; Write-UpdLog 'RELAUNCH OK' } catch { Write-UpdLog ('RELAUNCH FAILED: ' + `$_.Exception.Message) }
+Remove-Item -LiteralPath '$qNew' -Force -ErrorAction SilentlyContinue
+"@
+}
+
+function Invoke-SelfUpdate {
+    param([string]$DownloadUrl, [string]$NewVersion, [long]$ExpectedSize = 0, [string]$ExpectedSha256 = "")
+
+    # O exe baixado roda elevado logo depois: hash e tamanho nao sao opcionais.
+    if ($ExpectedSha256 -match '^(?:sha256:)?([0-9A-Fa-f]{64})$') {
+        $expectedHash = $Matches[1].ToLower()
+    }
+    else {
+        $expectedHash = ""
+        Add-GuiLog (T 'Update: release publishes no SHA-256 digest - integrity check unavailable') 'WARN'
+    }
+
+    $currentExe = [string]$env:SETTVPN_EXE
+    if (-not $currentExe -or -not (Test-Path -LiteralPath $currentExe)) {
+        Add-GuiLog ((T 'Self-update failed: {0}') -f 'SETTVPN_EXE not found') 'ERROR'
+        return $false
+    }
+    $newExe = Join-Path $Script:TempDir "SettVPN_v$NewVersion.exe"
+
+    Add-GuiLog ((T 'Downloading update...') + " v$NewVersion") 'INFO'
+
+    $body = Get-UpdateProgressBody -NewVersion $NewVersion
+
+    $progress = New-UpdateWindow -Title (T 'SETT VPN Update') -BodyXaml $body -Width 420
+    $txtStatus = $progress.FindName('txtStatus')
+    $state = @{ Launched = $false }
+
+    # Baixa depois que o popup renderizou; DownloadFile e sincrono (async abortava no host 5.1).
+    $progress.Add_ContentRendered({
+        $ok = $false; $reason = ''
+        for ($attempt = 1; $attempt -le 3 -and -not $ok; $attempt++) {
+            try {
+                $wc = New-Object System.Net.WebClient
+                try { $wc.DownloadFile([Uri]$DownloadUrl, $newExe) } finally { $wc.Dispose() }
+                $got = (Get-Item -LiteralPath $newExe -ErrorAction Stop).Length
+                if ($ExpectedSize -gt 0 -and $got -ne $ExpectedSize) {
+                    throw "incomplete download ($got / $ExpectedSize bytes)"
+                }
+                # Asset errado (release mal publicado) nao pode substituir o exe em uso.
+                $fileVer = [string]([System.Diagnostics.FileVersionInfo]::GetVersionInfo($newExe).ProductVersion)
+                $m = [regex]::Match($fileVer, '^\d+\.\d+\.\d+')
+                if (-not $m.Success -or $m.Value -ne $NewVersion) { throw "version mismatch ($fileVer)" }
+                if ($expectedHash) {
+                    $actual = (Get-FileHash -LiteralPath $newExe -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+                    if ($actual -ne $expectedHash) { throw 'SHA-256 mismatch' }
+                    Add-GuiLog (T 'Update: SHA-256 verified') 'OK'
+                }
+                $ok = $true
+            }
+            catch {
+                $reason = $_.Exception.Message
+                Add-GuiLog ((T 'Update download failed: {0}') -f $reason) 'WARN'
+                Remove-Item -LiteralPath $newExe -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 600
+            }
+        }
+        if (-not $ok) {
+            Add-GuiLog ((T 'Update download failed: {0}') -f $reason) 'ERROR'
+            $progress.Close()
+            return
+        }
+
+        $txtStatus.Text = T 'Restarting SETT VPN...'
+        try {
+            $logPath = Join-Path $Script:TempDir 'updater.log'
+            $currentPid = [System.Diagnostics.Process]::GetCurrentProcess().Id
+            $updaterScript = Get-SelfUpdaterScript -NewExe $newExe -CurrentExe $currentExe `
+                -LogPath $logPath -WaitPid $currentPid -ExpectedHash $expectedHash
+            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($updaterScript))
+            Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-EncodedCommand', $encoded
+            ) | Out-Null
+            $state.Launched = $true
+        }
+        catch {
+            Add-GuiLog ((T 'Self-update failed: {0}') -f $_) 'ERROR'
+        }
+        $progress.Close()
+    }.GetNewClosure())
+
+    $progress.ShowDialog() | Out-Null
+    return [bool]$state.Launched
+}
+
+function Invoke-CheckForUpdates {
+    param([string]$RepoOwner = 'otaviozanon', [string]$RepoName = 'SettVPN')
+
+    $current = Get-AppVersion
+    if (-not $current) { return $false }
+
+    Add-GuiLog (T 'Checking for updates...') 'INFO'
+    try {
+        # .NET Framework (host WinPS 5.1) nao usa TLS 1.2 por padrao: a API aborta.
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest" `
+            -Headers @{ 'User-Agent' = "SETTVPN/$current" } -TimeoutSec 8
+
+        $latest = Get-UpdateAvailability -CurrentVersion $current -LatestTag ([string]$release.tag_name)
+        if (-not $latest) {
+            Add-GuiLog ((T 'SETT VPN is up to date (v{0})') -f $current) 'OK'
+            return $false
+        }
+
+        $asset = $release.assets | Where-Object { $_.name -eq 'SettVPN.exe' } | Select-Object -First 1
+        if (-not $asset) { Add-GuiLog (T 'No .exe asset found in latest release') 'ERROR'; return $false }
+
+        Add-GuiLog ((T 'Update available: v{0} (current v{1})') -f $latest, $current) 'WARN'
+        if (-not (Show-UpdateConfirmDialog -CurrentVersion $current -NewVersion $latest)) {
+            Add-GuiLog (T 'Update postponed by user') 'INFO'
+            return $false
+        }
+
+        return (Invoke-SelfUpdate -DownloadUrl ([string]$asset.browser_download_url) -NewVersion $latest `
+            -ExpectedSize ([long](Get-PropOr $asset 'size' 0)) -ExpectedSha256 ([string](Get-PropOr $asset 'digest' '')))
+    }
+    catch {
+        Add-GuiLog ((T 'Update check failed: {0}') -f $_) 'WARN'
+        return $false
+    }
+}
+
 function Start-SettVPN-Gui {
     Add-Type -AssemblyName PresentationFramework
     Add-Type -AssemblyName PresentationCore
@@ -710,8 +979,12 @@ function Start-SettVPN-Gui {
     $Script:AppSettings = Get-AppSettings
     $Script:Language = [string]$Script:AppSettings.Language
 
-    # Configuracao manual pode ter mudado fora do app (tarefa removida, etc).
+    # Configuracao manual pode ter mudado fora do app (tarefa removida, exe movido, etc).
     $autoNow = Test-AutoStart
+    if ($Script:AppSettings.StartWithWindows -and -not $autoNow) {
+        # Exe movido ou entrada apagada: recria apontando para o caminho atual.
+        $autoNow = Set-AutoStart -Enabled $true
+    }
     if ($autoNow -ne [bool]$Script:AppSettings.StartWithWindows) {
         $Script:AppSettings.StartWithWindows = $autoNow
         Save-AppSettings $Script:AppSettings
@@ -1912,13 +2185,24 @@ else {
     Apply-Language
     Add-GuiLog (T 'Ready. Refresh the server list.') "INFO"
 
-    $Script:MainFrame = New-Object System.Windows.Threading.DispatcherFrame
     $Script:GuiWindow.Show()
     if ($Script:AppSettings.StartMinimized) {
         # Abre sem janela; o icone da bandeja (ou abrir o exe de novo) traz de volta.
         $Script:GuiWindow.Hide()
         $Script:GuiWindow.ShowInTaskbar = $false
     }
+
+    # Atualizacao: release mais novo no GitHub, logo ao abrir.
+    if (Invoke-CheckForUpdates) {
+        # Atualizador ja foi disparado: fecha de forma limpa e sai para ele trocar o exe.
+        $Script:AllowClose = $true
+        try { $Script:GuiWindow.Close() } catch {}
+        Stop-V2Ray
+        if ($Script:ProxyActive) { Disable-SystemProxy }
+        return
+    }
+
+    $Script:MainFrame = New-Object System.Windows.Threading.DispatcherFrame
 
     # Força o ícone nativo da janela (barra de tarefas) via WM_SETICON
     try {

@@ -371,6 +371,31 @@ function Save-AppSettings {
     catch { return $false }
 }
 
+function Get-AppVersion {
+    # Versao embutida no exe pelo build.ps1 (AssemblyInformationalVersion).
+    # Sem launcher nao existe exe para atualizar: devolve vazio e o check e pulado.
+    $exe = $env:SETTVPN_EXE
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { return '' }
+    try {
+        $v = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion
+        if ($v -match '^(\d+\.\d+\.\d+)') { return $Matches[1] }
+    }
+    catch { }
+    return ''
+}
+
+function Get-UpdateAvailability {
+    # Puro (sem rede) para teste: devolve a tag nova quando e mais recente, senao $null.
+    param([string]$CurrentVersion, [string]$LatestTag)
+
+    $current = $null; $latest = $null
+    if (-not [version]::TryParse([string]$CurrentVersion, [ref]$current)) { return $null }
+    $tag = ([string]$LatestTag).TrimStart('v')
+    if (-not [version]::TryParse($tag, [ref]$latest)) { return $null }
+    if ($latest -le $current) { return $null }
+    return $tag
+}
+
 function Get-AutoStartCommand {
     # Precisa ser o exe (e nao o script): o caminho vem do launcher.
     $exe = $env:SETTVPN_EXE
@@ -397,7 +422,9 @@ function Set-AutoStart {
             catch { & schtasks /delete /tn $TaskName /f 2>$null | Out-Null }
         }
         Remove-ItemProperty -Path $RunKey -Name 'SettVPN' -ErrorAction SilentlyContinue
-        return $true
+        # OFF so vale se nao sobrou tarefa nem entrada: senao o app voltaria no proximo logon.
+        return (-not (Test-AutoStartTask -TaskName $TaskName) -and
+            $null -eq (Get-ItemProperty -Path $RunKey -Name 'SettVPN' -ErrorAction SilentlyContinue))
     }
 
     $cmd = Get-AutoStartCommand
@@ -430,8 +457,26 @@ function Set-AutoStart {
 
 function Test-AutoStart {
     param([string]$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run', [string]$TaskName = 'SettVPN')
-    if (Test-AutoStartTask -TaskName $TaskName) { return $true }
-    return $null -ne (Get-ItemProperty -Path $RunKey -Name 'SettVPN' -ErrorAction SilentlyContinue)
+
+    # A entrada precisa apontar para o exe atual: app portatil movido de pasta
+    # deixaria a tarefa no caminho antigo e nao subiria no logon.
+    $exe = (Get-AutoStartCommand).Trim('"')
+    $sameExe = {
+        param([string]$Path)
+        (-not $exe) -or ((($Path).Trim('"')) -eq $exe)
+    }
+
+    if (Test-AutoStartTask -TaskName $TaskName) {
+        try {
+            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+            if (& $sameExe ([string]$task.Actions[0].Execute)) { return $true }
+        }
+        catch { return $true }
+    }
+
+    $entry = Get-ItemProperty -Path $RunKey -Name 'SettVPN' -ErrorAction SilentlyContinue
+    if ($null -eq $entry) { return $false }
+    return (& $sameExe ([string]$entry.SettVPN))
 }
 
 function T {
@@ -521,6 +566,24 @@ function Get-UiStringsPt {
         'menu:TUN' = 'Modo TUN (liga/desliga)'
         'menu:Exit' = 'Sair'
         'Could not register the startup entry' = 'Não foi possível registrar a inicialização'
+        'Checking for updates...' = 'Verificando atualizações...'
+        'SETT VPN is up to date (v{0})' = 'O SETT VPN está atualizado (v{0})'
+        'Update available: v{0} (current v{1})' = 'Atualização disponível: v{0} (atual v{1})'
+        'Update check failed: {0}' = 'Falha ao verificar atualizações: {0}'
+        'No .exe asset found in latest release' = 'Nenhum .exe encontrado no release mais recente'
+        'Update postponed by user' = 'Atualização adiada pelo usuário'
+        'Update available' = 'Atualização disponível'
+        'A new version of SETT VPN is ready to install. Update now?' = 'Uma nova versão do SETT VPN está pronta para instalar. Atualizar agora?'
+        'Later' = 'Depois'
+        'Update now' = 'Atualizar agora'
+        'SETT VPN Update' = 'Atualização do SETT VPN'
+        'Downloading update...' = 'Baixando atualização...'
+        'Downloading...' = 'Baixando...'
+        'Restarting SETT VPN...' = 'Reiniciando o SETT VPN...'
+        'Update download failed: {0}' = 'Falha ao baixar a atualização: {0}'
+        'Update: SHA-256 verified' = 'Atualização: SHA-256 verificado'
+        'Update: release publishes no SHA-256 digest - integrity check unavailable' = 'Atualização: o release não publica SHA-256 - verificação de integridade indisponível'
+        'Self-update failed: {0}' = 'Falha no autoatualizador: {0}'
         'One rule per line. Domains (netflix.com) and IPs/CIDRs (10.0.0.0/8) go DIRECT, outside the VPN. TUN mode only. Lines starting with # are ignored.' = 'Uma regra por linha. Domínios (netflix.com) e IPs/CIDRs (10.0.0.0/8) saem DIRETO, fora da VPN. Só no modo TUN. Linhas com # são ignoradas.'
 
         "Kill switch`n`nBlocks ALL Windows outbound traffic (firewall profiles) except xray, the local proxy and the tunnel interface. If the VPN drops, nothing leaks to the internet.`n`nTUN mode only. Requires admin (UAC). On disconnect the firewall is restored; if the app is killed, the next start restores it (UAC)." = "Kill switch`n`nBloqueia TODA a saída do Windows (perfis de firewall) exceto o xray, o proxy local e a interface do túnel. Se a VPN cair, nada vaza para a internet.`n`nSó no modo TUN. Exige admin (UAC). Ao desconectar o firewall é restaurado; se o app for morto, o próximo start restaura (UAC)."

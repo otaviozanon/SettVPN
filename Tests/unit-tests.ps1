@@ -111,8 +111,22 @@ Assert-True (Set-AutoStart -Enabled $true -RunKey $testKey -TaskName '') 'Autost
 Assert-True (Test-AutoStart -RunKey $testKey -TaskName '') 'Autostart: detecta entrada'
 Assert-True (Set-AutoStart -Enabled $false -RunKey $testKey -TaskName '') 'Autostart: remove entrada'
 Assert-True (-not (Test-AutoStart -RunKey $testKey -TaskName '')) 'Autostart: entrada removida'
+if (-not (Test-Path $testKey)) { New-Item -Path $testKey -Force | Out-Null }
+Set-ItemProperty -Path $testKey -Name 'SettVPN' -Value '"C:\pasta-antiga\SettVPN.exe"'
+Assert-True (-not (Test-AutoStart -RunKey $testKey -TaskName '')) 'Autostart: entrada de outro caminho (exe movido) nao conta'
 Assert-True ((Get-AutoStartCommand) -match '\.exe"?$') 'Autostart: comando aponta para um exe'
 Remove-Item $testKey -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host "`n== Atualizacao ==" -ForegroundColor Cyan
+Assert-Equal (Get-UpdateAvailability -CurrentVersion '1.7.2' -LatestTag 'v1.7.3') '1.7.3' 'Update: tag mais nova conta'
+Assert-True ($null -eq (Get-UpdateAvailability -CurrentVersion '1.7.3' -LatestTag 'v1.7.3')) 'Update: mesma versao nao atualiza'
+Assert-True ($null -eq (Get-UpdateAvailability -CurrentVersion '1.7.3' -LatestTag 'v1.7.2')) 'Update: tag antiga nao conta'
+Assert-True ($null -eq (Get-UpdateAvailability -CurrentVersion 'dev' -LatestTag 'v1.7.3')) 'Update: versao local invalida nao checa'
+Assert-True ($null -eq (Get-UpdateAvailability -CurrentVersion '1.7.2' -LatestTag 'nightly')) 'Update: tag invalida nao checa'
+$oldExe = $env:SETTVPN_EXE
+$env:SETTVPN_EXE = ''
+Assert-Equal (Get-AppVersion) '' 'Update: sem exe do launcher nao checa'
+$env:SETTVPN_EXE = $oldExe
 
 # Servidores de menor ping (CDN) costumam estar mortos: amostra precisa se espalhar.
 $spreadAll = @(Get-SpreadSample -Items @(1, 2, 3) -Max 12)
@@ -495,7 +509,8 @@ $guiSrc = [System.IO.File]::ReadAllText((Join-Path $root 'Core\SettVPN_Gui.ps1')
 $guiXamls = @(
     @{ Name = 'janela principal'; Pattern = '\[xml\]\$xaml = @"(?<x>[\s\S]*?)"@' },
     @{ Name = 'split tunneling'; Pattern = '\$xaml = @''(?<x>[\s\S]*?)''@' },
-    @{ Name = 'configuracoes'; Pattern = '\[xml\]\$settingsXaml = @''(?<x>[\s\S]*?)''@' }
+    @{ Name = 'configuracoes'; Pattern = '\[xml\]\$settingsXaml = @''(?<x>[\s\S]*?)''@' },
+    @{ Name = 'janela de atualizacao'; Pattern = '\$xaml = @"(?<x>[\s\S]*?)"@' }
 )
 foreach ($case in $guiXamls) {
     $m = [regex]::Match($guiSrc, $case.Pattern)
@@ -515,6 +530,7 @@ Assert-True ($guiSrc -match 'x:Name="cbCountry"' -and $guiSrc -match 'ComboBox')
 Assert-True ($guiSrc -match 'x:Name="btnSort"' -and $guiSrc -match 'SortDesc') 'GUI: ordenacao por ping existe'
 Assert-True ($guiSrc -notmatch 'x:Name="btnFilter"') 'GUI: sem botao TESTAR (ATUALIZAR ja testa)'
 Assert-True ($guiSrc -match 'function Sync-SystemProxy' -and $guiSrc -match '(?m)^\s+Sync-SystemProxy\s*$') 'GUI: proxy do sistema liga sozinho ao conectar'
+Assert-True ($guiSrc -match 'function Invoke-CheckForUpdates' -and $guiSrc -match 'if \(Invoke-CheckForUpdates\)') 'GUI: checa atualizacao no GitHub ao abrir'
 
 Write-Host "`n== Kill switch: script elevado ==" -ForegroundColor Cyan
 
