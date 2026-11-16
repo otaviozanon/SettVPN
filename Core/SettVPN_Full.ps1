@@ -1,5 +1,5 @@
 ﻿# SettVPN - Automated VPN Connection Manager
-# Uses abc-configs free VPN servers with embedded v2ray-core
+# Uses public free VPN server lists with embedded v2ray-core
 
 param([switch]$Console)
 
@@ -20,6 +20,9 @@ $Script:XrayLog = Join-Path $Script:TempDir "xray.log"
 $Script:ReadmeCache = Join-Path $Script:TempDir "abc-configs-README.md"
 $Script:SubCache = Join-Path $Script:TempDir "pawdroid-sub.txt"
 $Script:Sub2Cache = Join-Path $Script:TempDir "peasoft-sub.txt"
+$Script:Sub3Cache = Join-Path $Script:TempDir "awesome-vpn-sub.txt"
+$Script:Sub4Cache = Join-Path $Script:TempDir "eternity-sub.txt"
+$Script:Sub5Cache = Join-Path $Script:TempDir "barry-sub1.txt"
 $Script:V2RayProcess = $null
 $Script:CurrentConfig = $null
 $Script:LastFailReason = ""
@@ -38,9 +41,12 @@ $Script:ScanPortBase = 20000
 $Script:ExitIp = ""
 $Script:KillSwitch = $false
 $Script:FuncSource = $null
-$Script:AbcConfigsUrl = "https://raw.githubusercontent.com/FreeFolksOn/abc-configs-free-vpn-proxy-list/main/README.md"
+$Script:AbcConfigsUrl = "https://raw.githubusercontent.com/freeVpnMan/abc-configs-free-vpn-proxy/main/README.md"
 $Script:SubConfigsUrl = "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub"
 $Script:Sub2ConfigsUrl = "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt"
+$Script:Sub3ConfigsUrl = "https://raw.githubusercontent.com/awesome-vpn/awesome-vpn/master/all"
+$Script:Sub4ConfigsUrl = "https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity.txt"
+$Script:Sub5ConfigsUrl = "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Sub1.txt"
 $Script:SettingsFile = Join-Path $env:APPDATA "SettVPN\settings.json"
 $Script:Language = 'en'
 
@@ -904,10 +910,6 @@ function Parse-VmessConfig {
     return $null
 }
 
-function Download-AbcConfigs {
-    return Get-CachedContent -Url $Script:AbcConfigsUrl -Cache $Script:ReadmeCache -Label "abc-configs"
-}
-
 function Get-CachedContent {
     param([string]$Url, [string]$Cache, [string]$Label)
 
@@ -977,6 +979,11 @@ function Get-ShortName {
     return $Name.Substring(0, [Math]::Max(1, $Max - 3)).TrimEnd() + "..."
 }
 
+function Download-AbcConfigs {
+    # Atualizado 1x por dia direto no README (tabela "Latest 30 configs").
+    return Get-CachedContent -Url $Script:AbcConfigsUrl -Cache $Script:ReadmeCache -Label "abc-configs"
+}
+
 function Download-SubSource {
     param([string]$Url, [string]$Cache, [string]$Label)
 
@@ -986,10 +993,10 @@ function Download-SubSource {
 function Get-AllConfigs {
     $configs = @()
 
-    # Source 1: abc-configs (HTML README with <code> tags)
+    # Fonte 1: abc-configs (tabela HTML no README, atualizada 1x por dia)
     $content = Download-AbcConfigs
     if ($content) {
-        $pattern = '<code>(vless://[^<]+|vmess://[^<]+|trojan://[^<]+|ss://[^<]+)</code>'
+        $pattern = '<code>((?:vless|vmess|trojan|ss)://[^<]+)</code>'
         $matches = [regex]::Matches($content, $pattern)
 
         foreach ($match in $matches) {
@@ -1000,10 +1007,13 @@ function Get-AllConfigs {
         Write-Status "abc-configs: $($matches.Count) found" "INFO"
     }
 
-    # Sources 2-3: base64 subscription lists
+    # Fontes: listas de assinatura (base64 ou texto puro) com vless/vmess/trojan/ss.
     $subSources = @(
         @{ Url = $Script:SubConfigsUrl;  Cache = $Script:SubCache;  Label = "Pawdroid" },
-        @{ Url = $Script:Sub2ConfigsUrl; Cache = $Script:Sub2Cache; Label = "peasoft" }
+        @{ Url = $Script:Sub2ConfigsUrl; Cache = $Script:Sub2Cache; Label = "peasoft" },
+        @{ Url = $Script:Sub3ConfigsUrl; Cache = $Script:Sub3Cache; Label = "awesome-vpn" },
+        @{ Url = $Script:Sub4ConfigsUrl; Cache = $Script:Sub4Cache; Label = "Eternity" },
+        @{ Url = $Script:Sub5ConfigsUrl; Cache = $Script:Sub5Cache; Label = "barry-far" }
     )
 
     foreach ($src in $subSources) {
@@ -1046,7 +1056,7 @@ function Get-AllConfigs {
     $configs = $unique
 
     if ($configs.Count -gt 400) {
-        $configs = @($configs[0..399])
+        $configs = @(Get-FairSample -Items $configs -Max 400)
     }
     Write-Status ((T 'Found {0} configs (after filtering)') -f $configs.Count) "INFO"
     return $configs
@@ -1808,6 +1818,20 @@ function Get-SpreadSample {
     $step = [Math]::Max(1, [int][Math]::Floor($Items.Count / $Max))
     $picked = @()
     for ($i = 0; $i -lt $Items.Count -and $picked.Count -lt $Max; $i += $step) { $picked += $Items[$i] }
+    return $picked
+}
+
+function Get-FairSample {
+    param([array]$Items, [int]$Max = 400)
+
+    # Limite de configs sem descartar fontes inteiras: indices proporcionais ao
+    # longo da lista inteira (o corte [0..Max] comia tudo que vinha no fim).
+    if (-not $Items -or $Items.Count -le $Max) { return @($Items) }
+    $picked = @()
+    for ($i = 0; $i -lt $Max; $i++) {
+        $idx = [int][Math]::Floor($i * $Items.Count / $Max)
+        $picked += $Items[$idx]
+    }
     return $picked
 }
 
@@ -2963,7 +2987,7 @@ function Show-Banner {
     Write-Host "           SETT VPN MANAGER" -ForegroundColor Cyan
     Write-Host "  ========================================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  Source: abc-configs (GitHub - Auto-Update)" -ForegroundColor DarkGray
+    Write-Host "  Source: public free server lists (GitHub - Auto-Update)" -ForegroundColor DarkGray
     Write-Host ""
 
     if (Get-V2RayStatus) {

@@ -80,7 +80,7 @@ Log: `%TEMP%\SettVPN\settvpn.log`. Config and GeoIP data are also extracted to `
 - **Free servers are unreliable.** Lists change constantly; that is why the app tests before showing and reconnects automatically.
 - **Use at your own risk.** Public lists may include servers from unknown operators. Do not send sensitive data through them.
 - **Antivirus warnings** may appear: the launcher hosts PowerShell in-process and embeds Xray. The source is fully auditable in this repository.
-- **Server sources:** [abc-configs](https://github.com/FreeFolksOn/abc-configs-free-vpn-proxy-list), [Pawdroid Free-servers](https://github.com/Pawdroid/Free-servers), [peasoft NoMoreWalls](https://github.com/peasoft/NoMoreWalls).
+- **Server sources:** [abc-configs](https://github.com/freeVpnMan/abc-configs-free-vpn-proxy), [Pawdroid Free-servers](https://github.com/Pawdroid/Free-servers), [peasoft NoMoreWalls](https://github.com/peasoft/NoMoreWalls), [awesome-vpn](https://github.com/awesome-vpn/awesome-vpn), [ShadowsocksAggregator](https://github.com/mahdibland/ShadowsocksAggregator), [barry-far V2ray-Config](https://github.com/barry-far/V2ray-Config).
 - **GeoIP:** DB-IP Lite, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) © [DB-IP](https://db-ip.com).
 
 ## License

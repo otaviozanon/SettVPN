@@ -137,6 +137,16 @@ Assert-Equal $spread[0] 1 'Amostra: comeca no primeiro'
 Assert-True ($spread[1] -ge 10) 'Amostra: espalha em vez de pegar o topo'
 Assert-Equal @(Get-SpreadSample -Items @() -Max 5).Count 0 'Amostra: lista vazia volta vazia'
 
+# Cap de 400 com varias fontes: corte [0..399] descartava as fontes do fim.
+$fairAll = @(Get-FairSample -Items @(1, 2, 3) -Max 400)
+Assert-Equal $fairAll.Count 3 'Fair: lista menor que o limite volta inteira'
+$fair = @(Get-FairSample -Items @(1..1000) -Max 400)
+Assert-Equal $fair.Count 400 'Fair: limita ao Max'
+Assert-Equal $fair[0] 1 'Fair: comeca no primeiro'
+Assert-True ($fair[$fair.Count - 1] -gt 900) 'Fair: alcanca o fim da lista'
+Assert-Equal @($fair | Select-Object -Unique).Count 400 'Fair: sem duplicados'
+Assert-Equal @(Get-FairSample -Items @() -Max 5).Count 0 'Fair: lista vazia volta vazia'
+
 # Ping da tela: usa a latencia real (dentro do tunel) e cai no TCP so quando nao existe.
 Assert-Equal (Get-ServerPingMs -Config @{ Ping = 12; RealPing = 340 }) 340 'Ping: prefere latencia real'
 Assert-Equal (Get-ServerPingMs -Config @{ Ping = 12; RealPing = 9999 }) 12 'Ping: 9999 (medida falhou) cai no TCP'
