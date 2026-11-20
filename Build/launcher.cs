@@ -198,5 +198,9 @@ class SettVPNLauncher
         catch
         {
         }
+
+        // Runspaces em segundo plano (estatisticas, scan) continuam vivos depois
+        // que o script retorna e seguram o processo. O teardown ja rodou: sai de fato.
+        Environment.Exit(0);
     }
 }
